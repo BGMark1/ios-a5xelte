@@ -13,7 +13,7 @@ diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
  #define HGP_VA_BASE     0x10000000ull
  #define HGP_VA_END      0x40000000ull   /* the one L2 table covers 1 GiB */
  
-@@ -1409,7 +1409,7 @@
+@@ -1409,12 +1409,16 @@
   * Shared bring-up (GPU present and the HeroGPU user client): MMIO, all
   * cores powered and left on, and one address space for everything:
   *   0x02000000  test pages        0x04000000  the panel
@@ -22,6 +22,15 @@ diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
   *   0x40000000..0x7fffffff  user buffers (HeroGPU), L3 tables on demand
   * The user range has its own L2 table at the top of the scratch block and
   * its own L3 pool. Idempotent; called with hg_mtx held.
+  */
+ #define HGU_L2_OFF      0x110000u
++
++_Static_assert(HGU_L2_OFF + 0x1000u <= HGP_L3_OFF, "present tables overlap the user L2");
++_Static_assert(HGP_L3_OFF + HGP_SLOTS * HGP_SLOT_TABLES * 0x1000u <= HG_SCR_BYTES,
++    "present tables exceed GPU scratch memory");
+ /*
+  * The L3 pool has a 2 MiB block of its own, a table for each 2 MiB of the range. It was at the top of the scratch block,
+  * where the 176th table was the test block's: taking it zeroed the GPU's level-0 table and put a page's PTE in it, and from
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
