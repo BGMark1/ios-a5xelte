@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -1358,9 +1358,9 @@
+  * and runs tiler then fragment. Run only with herogpu<=2 (no test jobs).
+  */
+ #define HGP_SLOTS       4u
+-#define HGP_SLOT_TABLES 4u
++#define HGP_SLOT_TABLES 6u
+ #define HGP_SLOT_PAGES  (HGP_SLOT_TABLES * 512u)
+-#define HGP_L3_OFF      0x100000u       /* slot L3 tables, in the scratch block */
++#define HGP_L3_OFF      0x120000u       /* slot L3 tables, in the scratch block */
+ #define HGP_VA_BASE     0x10000000ull
+ #define HGP_VA_END      0x40000000ull   /* the one L2 table covers 1 GiB */
+ 
+@@ -1409,7 +1409,7 @@
+  * Shared bring-up (GPU present and the HeroGPU user client): MMIO, all
+  * cores powered and left on, and one address space for everything:
+  *   0x02000000  test pages        0x04000000  the panel
+- *   0x0a000000  the scratch block 0x10000000  present slots (8 MiB each)
++ *   0x0a000000  the scratch block 0x10000000  present slots (12 MiB each)
+  *   0x40000000..0x7fffffff  user buffers (HeroGPU), L3 tables on demand
+  * The user range has its own L2 table at the top of the scratch block and
+  * its own L3 pool. Idempotent; called with hg_mtx held.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -70,7 +70,7 @@
+ extern "C" int herolte_gpu_present_slot(uint32_t id, uint64_t first_pa);
+ extern "C" int herolte_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n);
+ extern "C" bool herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h);
+-#define SWEET_FB_GPU_MAX_PAGES 2048     /* one 8 MiB GPU slot */
++#define SWEET_FB_GPU_MAX_PAGES 3072     /* one 12 MiB GPU slot */
+ #endif
+ 
+ enum {
