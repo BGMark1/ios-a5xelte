@@ -68,6 +68,51 @@ edit('src/gallium/drivers/panfrost/pan_bo.c',
      "   if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {\n"
      "#endif")
 
+# Adapt danstronics/ios-s9plus-exynos's HMC switch. HeroGPU retains the
+# underlying mapping until BO destruction, so Mesa may retain its pointer.
+edit('src/gallium/drivers/panfrost/pan_bo.c',
+     '#include <stdio.h>\n',
+     '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n')
+edit('src/gallium/drivers/panfrost/pan_bo.c',
+     'static void\npanfrost_bo_free(struct panfrost_bo *bo)\n{\n',
+     '''#ifdef __APPLE__
+static pthread_once_t hero_mapping_cache_once = PTHREAD_ONCE_INIT;
+static bool hero_mapping_cache_enabled;
+
+static void
+hero_mapping_cache_init(void)
+{
+   const char *value = getenv("HMC");
+   hero_mapping_cache_enabled = value && strcmp(value, "1") == 0;
+}
+
+static bool
+hero_keep_mapping(void)
+{
+   pthread_once(&hero_mapping_cache_once, hero_mapping_cache_init);
+   return hero_mapping_cache_enabled;
+}
+
+static void panfrost_bo_munmap(struct panfrost_bo *bo);
+#endif
+
+static void
+panfrost_bo_free(struct panfrost_bo *bo)
+{
+#ifdef __APPLE__
+   if (bo->ptr.cpu)
+      panfrost_bo_munmap(bo);
+#endif
+''')
+edit('src/gallium/drivers/panfrost/pan_bo.c',
+     '      /* When the reference count goes to zero, we need to cleanup */\n'
+     '      panfrost_bo_munmap(bo);\n',
+     '      /* Cached HeroGPU BOs may retain their CPU pointer until destruction. */\n'
+     '#ifdef __APPLE__\n'
+     '      if (!hero_keep_mapping())\n'
+     '#endif\n'
+     '         panfrost_bo_munmap(bo);\n')
+
 # OSMesa: the GPU screen first, softpipe when it is unavailable.
 edit('src/gallium/targets/osmesa/osmesa_target.c',
      "struct pipe_screen *\nosmesa_create_screen(void)\n{\n",
