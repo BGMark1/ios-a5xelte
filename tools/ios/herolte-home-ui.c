@@ -2,6 +2,7 @@ typedef void *object;
 typedef void *selector;
 typedef void *method;
 typedef struct { double width, height, pixel_scale, radius; } icon_info;
+typedef struct { double x, y, width, height; } screen_rect;
 
 extern object objc_getClass(const char *name);
 extern object object_getClass(object value);
@@ -13,7 +14,9 @@ extern void objc_msgSend(void);
 extern char *strstr(const char *text, const char *needle);
 extern int access(const char *path, int mode);
 extern void *dlopen(const char *path, int mode);
+extern void *dlsym(void *handle, const char *name);
 extern char *dlerror(void);
+extern void CFRelease(const void *value);
 extern char _dispatch_main_q;
 extern unsigned long long dispatch_time(unsigned long long base, long long delta);
 extern void dispatch_after_f(unsigned long long when, void *queue, void *context, void (*fn)(void *));
@@ -28,6 +31,70 @@ static object get(object target, const char *name)
 {
     return find_method(target, name) ?
         ((object (*)(object, selector))objc_msgSend)(target, sel_registerName(name)) : 0;
+}
+
+static double read_double(object target, const char *name)
+{
+    method getter = find_method(target, name);
+    if (!getter || method_getTypeEncoding(getter)[0] != 'd')
+        return -1;
+    return ((double (*)(object, selector))objc_msgSend)(target, sel_registerName(name));
+}
+
+static screen_rect read_rect(object target, const char *name)
+{
+    method getter = find_method(target, name);
+    if (!getter || !strstr(method_getTypeEncoding(getter), "{CGRect={CGPoint=dd}{CGSize=dd}}"))
+        return (screen_rect){0};
+    return ((screen_rect (*)(object, selector))objc_msgSend)(target, sel_registerName(name));
+}
+
+static object string(const char *value)
+{
+    object cls = objc_getClass("NSString");
+    if (!find_method(cls, "stringWithUTF8String:"))
+        return 0;
+    return ((object (*)(object, selector, const char *))objc_msgSend)(
+        cls, sel_registerName("stringWithUTF8String:"), value);
+}
+
+static double trait(object traits, const char *name)
+{
+    object key = string(name);
+    if (!key || !find_method(traits, "objectForKey:"))
+        return -1;
+    object value = ((object (*)(object, selector, object))objc_msgSend)(
+        traits, sel_registerName("objectForKey:"), key);
+    return read_double(value, "doubleValue");
+}
+
+static void trace_screen(void *unused)
+{
+    (void)unused;
+    if (access("/private/var/herolte/screen.trace", 0) != 0)
+        return;
+    object screen = get(objc_getClass("UIScreen"), "mainScreen");
+    screen_rect bounds = read_rect(screen, "bounds");
+    screen_rect native = read_rect(screen, "nativeBounds");
+    herodrm_log("home screen trace: bounds %.0fx%.0f scale %.2f native %.0fx%.0f scale %.2f",
+                bounds.width, bounds.height, read_double(screen, "scale"),
+                native.width, native.height, read_double(screen, "nativeScale"));
+
+    void *gestalt = dlopen("/usr/lib/libMobileGestalt.dylib", 2);
+    object (*copy_answer)(object, object) = gestalt ? dlsym(gestalt, "MGCopyAnswer") : 0;
+    if (!copy_answer)
+        return;
+    object scale_key = string("MainScreenScale");
+    object artwork_key = string("ArtworkTraits");
+    object scale = scale_key ? copy_answer(scale_key, 0) : 0;
+    object artwork = artwork_key ? copy_answer(artwork_key, 0) : 0;
+    herodrm_log("home screen trace: MG MainScreenScale %.2f ArtworkScaleFactor %.2f ArtworkDeviceSubType %.0f",
+                read_double(scale, "doubleValue"), trait(artwork, "ArtworkScaleFactor"),
+                trait(artwork, "ArtworkDeviceSubType"));
+    if (scale)
+        CFRelease(scale);
+    if (artwork)
+        CFRelease(artwork);
 }
 
 static void trace_status_views(object view, const char *window, unsigned depth, unsigned *remaining)
@@ -127,10 +194,10 @@ static void adjust_icons(void *unused)
     object manager = get(controller, "iconManager");
     object provider = get(manager, "listLayoutProvider");
     object config = 0;
-    object string_class = objc_getClass("NSString");
-    if (find_method(provider, "layoutForIconLocation:") && find_method(string_class, "stringWithUTF8String:")) {
-        object location = ((object (*)(object, selector, const char *))objc_msgSend)(
-            string_class, sel_registerName("stringWithUTF8String:"), "SBIconLocationRoot");
+    if (find_method(provider, "layoutForIconLocation:")) {
+        object location = string("SBIconLocationRoot");
+        if (!location)
+            return;
         object layout = ((object (*)(object, selector, object))objc_msgSend)(
             provider, sel_registerName("layoutForIconLocation:"), location);
         config = get(layout, "layoutConfiguration");
@@ -177,4 +244,5 @@ __attribute__((constructor)) static void start(void)
     }
     dispatch_after_f(dispatch_time(0, 15000000000LL), &_dispatch_main_q, 0, adjust_icons);
     dispatch_after_f(dispatch_time(0, 10000000000LL), &_dispatch_main_q, 0, check_status_bars);
+    dispatch_after_f(dispatch_time(0, 20000000000LL), &_dispatch_main_q, 0, trace_screen);
 }
