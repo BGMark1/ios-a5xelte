@@ -1,0 +1,20 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -64,8 +64,14 @@
+ 	if (!app && (hgl_pid < 0 || proc_selfpid() != hgl_pid) && (hgl_sb_pid < 0 || proc_selfpid() != hgl_sb_pid)) {
+ 		return 0;
+ 	}
+-	return AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS |
+-	       AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION;
++	uint64_t flags = AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS;
++	int diagnose = 0;
++	/* Let dyld report a failed insertion for the two graphics daemons during diagnosis. */
++	if ((proc_selfpid() == hgl_pid || proc_selfpid() == hgl_sb_pid) &&
++	    PE_parse_boot_argn("herodylddiag", &diagnose, sizeof(diagnose)) && diagnose) {
++		return flags;
++	}
++	return flags | AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION;
+ }
+ 
+ /*
