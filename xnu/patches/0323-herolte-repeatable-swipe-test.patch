@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2813,6 +2813,29 @@
+ 	a5xelte_log_append(end, sizeof(end) - 1);
+ }
+ 
++static void
++hg_test_swipes(void)
++{
++	extern void sweet_hid_touch(int, int, int, int);
++	enum { finger = 9, steps = 12, count = 12 };
++	const int left = HG_PANEL_W / 5;
++	const int right = HG_PANEL_W * 4 / 5;
++	const int y = HG_PANEL_H * 3 / 5;
++
++	printf("HEROSWIPE BEGIN %u\n", (unsigned)count);
++	for (unsigned swipe = 0; swipe < count; swipe++) {
++		int start = swipe % 2 ? left : right;
++		int end = swipe % 2 ? right : left;
++		for (int step = 0; step <= steps; step++) {
++			sweet_hid_touch(finger, 1, start + (end - start) * step / steps, y);
++			hg_msleep(20);
++		}
++		sweet_hid_touch(finger, 0, end, y);
++		hg_msleep(1200);
++	}
++	printf("HEROSWIPE END\n");
++}
++
+ /*
+  * Boot-arg herotwrp=SECONDS: after that long the phone restarts into recovery by itself, as Samsung's sec_reboot does
+  * for "reboot recovery", so that a test runs with nobody at the buttons. The log has its last flush first.
+@@ -2830,6 +2853,10 @@
+ 			sweet_hid_key(3, 0);
+ 			printf("HEROCAP: sent Home press\n");
+ 			hg_msleep(4000);
++			uint32_t swipe = 0;
++			if (PE_parse_boot_argn("heroswipe", &swipe, sizeof(swipe)) && swipe == 1) {
++				hg_test_swipes();
++			}
+ 		}
+ 		hg_capture_panel();
+ 	}

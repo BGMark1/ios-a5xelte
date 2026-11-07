@@ -5,11 +5,13 @@ typedef struct { double width, height, pixel_scale, radius; } icon_info;
 
 extern object objc_getClass(const char *name);
 extern object object_getClass(object value);
+extern const char *class_getName(object cls);
 extern selector sel_registerName(const char *name);
 extern method class_getInstanceMethod(object cls, selector sel);
 extern const char *method_getTypeEncoding(method value);
 extern void objc_msgSend(void);
 extern char *strstr(const char *text, const char *needle);
+extern int access(const char *path, int mode);
 extern void *dlopen(const char *path, int mode);
 extern char *dlerror(void);
 extern char _dispatch_main_q;
@@ -26,6 +28,30 @@ static object get(object target, const char *name)
 {
     return find_method(target, name) ?
         ((object (*)(object, selector))objc_msgSend)(target, sel_registerName(name)) : 0;
+}
+
+static void trace_status_views(object view, const char *window, unsigned depth, unsigned *remaining)
+{
+    if (!view || !*remaining || depth > 18)
+        return;
+    const char *name = class_getName(object_getClass(view));
+    if (!depth || strstr(name, "StatusBar")) {
+        method getter = find_method(view, "visualProviderClass");
+        object provider = getter && method_getTypeEncoding(getter)[0] == '#' ?
+            get(view, "visualProviderClass") : 0;
+        herodrm_log("home status trace: window %s depth %u view %s provider %s",
+                    window, depth, name, provider ? class_getName(provider) : "-");
+        --*remaining;
+    }
+    object children = get(view, "subviews");
+    if (!find_method(children, "count") || !find_method(children, "objectAtIndex:"))
+        return;
+    unsigned long count = ((unsigned long (*)(object, selector))objc_msgSend)(children, sel_registerName("count"));
+    for (unsigned long i = 0; i < count && *remaining; ++i) {
+        object child = ((object (*)(object, selector, unsigned long))objc_msgSend)(
+            children, sel_registerName("objectAtIndex:"), i);
+        trace_status_views(child, window, depth + 1, remaining);
+    }
 }
 
 static int hide_status_fallback(object view, object status_bar, unsigned depth)
@@ -68,6 +94,10 @@ static void check_status_bars(void *unused)
     (void)unused;
     static unsigned checks;
     static int reported;
+    static int trace;
+    if (!checks)
+        trace = access("/private/var/herolte/status.trace", 0) == 0;
+    unsigned trace_remaining = trace && (checks == 25 || checks == 65) ? 40 : 0;
     object app = get(objc_getClass("UIApplication"), "sharedApplication");
     object windows = get(app, "windows");
     if (find_method(windows, "count") && find_method(windows, "objectAtIndex:")) {
@@ -75,6 +105,8 @@ static void check_status_bars(void *unused)
         for (unsigned long i = 0; i < count; ++i) {
             object window = ((object (*)(object, selector, unsigned long))objc_msgSend)(
                 windows, sel_registerName("objectAtIndex:"), i);
+            if (trace_remaining && window)
+                trace_status_views(window, class_getName(object_getClass(window)), 0, &trace_remaining);
             if (hide_status_fallback(window, 0, 0) && !reported) {
                 reported = 1;
                 herodrm_log("home status: hid UIKit diagnostic status bar");

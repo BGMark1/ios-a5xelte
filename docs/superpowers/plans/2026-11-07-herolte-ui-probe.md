@@ -12,3 +12,9 @@
 - [x] Add the boot flags, reuse the physical Home key event path and emit the capture to the log.
 - [x] Build the HEROLTE kernel in the private build repository.
 - [x] Start from TWRP, boot with `herotwrp=120 herocap=1 herohome=1`, recover the log and inspect the PNG. Confirm actual screen content and the timed return separately.
+
+**Repeatable performance check**
+
+- [x] Add an opt-in `heroswipe=1` sequence to the timed probe. Start from Home and alternate horizontal swipes. Mark the exact gesture window in the log.
+- [x] Summarize only the framebuffer samples contained inside that window. Reject a log with no complete window.
+- [x] Boot the same kernel with baseline and raised clocks, each with the same gesture sequence. Check that both screenshots show the expected UI before comparing the measured samples.
