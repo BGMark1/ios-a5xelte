@@ -1,0 +1,62 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2780,6 +2780,39 @@
+ 	}
+ }
+ 
++/* Write one sampled BGRA scanout image to the existing persistent log. */
++static void
++hg_capture_panel(void)
++{
++	extern void a5xelte_log_append(const char *, int);
++	static const char hex[] = "0123456789abcdef";
++	enum { step = 3, width = HG_PANEL_W / step, height = HG_PANEL_H / step };
++	char row[32 + width * 4];
++	vm_offset_t panel = ml_io_map(HG_FB_PA, HG_PANEL_BYTES);
++	if (!panel) {
++		printf("HEROCAP: panel mapping failed\n");
++		return;
++	}
++	int length = snprintf(row, sizeof(row), "\nHEROCAP BEGIN %u %u\n", (unsigned)width, (unsigned)height);
++	a5xelte_log_append(row, length);
++	for (unsigned y = 0; y < height; y++) {
++		const volatile uint32_t *line = (const volatile uint32_t *)(panel + y * step * HG_FB_STRIDE);
++		length = snprintf(row, sizeof(row), "HEROCAP ROW %u ", y);
++		for (unsigned x = 0; x < width; x++) {
++			uint32_t pixel = line[x * step];
++			uint16_t rgb565 = ((pixel >> 8) & 0xf800u) | ((pixel >> 5) & 0x07e0u) | ((pixel >> 3) & 0x001fu);
++			row[length++] = hex[(rgb565 >> 12) & 15];
++			row[length++] = hex[(rgb565 >> 8) & 15];
++			row[length++] = hex[(rgb565 >> 4) & 15];
++			row[length++] = hex[rgb565 & 15];
++		}
++		row[length++] = '\n';
++		a5xelte_log_append(row, length);
++	}
++	static const char end[] = "HEROCAP END\n";
++	a5xelte_log_append(end, sizeof(end) - 1);
++}
++
+ /*
+  * Boot-arg herotwrp=SECONDS: after that long the phone restarts into recovery by itself, as Samsung's sec_reboot does
+  * for "reboot recovery", so that a test runs with nobody at the buttons. The log has its last flush first.
+@@ -2788,6 +2821,18 @@
+ hg_twrp_thread(void *arg, __unused wait_result_t wr)
+ {
+ 	hg_msleep((uint32_t)(uintptr_t)arg * 1000);
++	uint32_t capture = 0, home = 0;
++	if (PE_parse_boot_argn("herocap", &capture, sizeof(capture)) && capture == 1) {
++		if (PE_parse_boot_argn("herohome", &home, sizeof(home)) && home == 1) {
++			extern void sweet_hid_key(int, int);
++			sweet_hid_key(3, 1);
++			hg_msleep(100);
++			sweet_hid_key(3, 0);
++			printf("HEROCAP: sent Home press\n");
++			hg_msleep(4000);
++		}
++		hg_capture_panel();
++	}
+ 	vm_offset_t pmu = ml_io_map(0x105c0000u, 0x1000);
+ 	printf("HEROLTE: herotwrp: to recovery in 12 s\n");
+ 	hg_msleep(12000);
