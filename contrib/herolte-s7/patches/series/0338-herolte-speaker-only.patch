@@ -1,0 +1,27 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 3a75c1e..a5e46f4 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2666,8 +2666,22 @@ ha_codec_setup(void)
+ 			hg_msleep(20);
+ 		}
+ 	}
++	/*
++	 * (0338) The table is what Linux left while it played to the speaker and the earpiece:
++	 * OUT3 (earpiece) mixes AIF1RX1/2 (0x6a0/0x6a2) beside AIF4TX to the MAX98506. With
++	 * heroearpiece=0 OUT3 gets no source and is muted, so media plays on the speaker only.
++	 */
++	int earpiece = 1;
++	PE_parse_boot_argn("heroearpiece", &earpiece, sizeof(earpiece));
++	if (!earpiece) {
++		ha_write(0x6a0, 0);
++		ha_write(0x6a2, 0);
++		ha_write(0x421, 0x380);
++		ha_write(0x425, 0x380);
++	}
+ 	ha_write(0x406, 0x33);
+ 	ha_write(0x400, 0x33);
++	printf("HEROLTE AUDIO: earpiece %s\n", earpiece ? "on" : "off (speaker only)");
+ 	hg_msleep(50);
+ 	uint16_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+ 	ha_read(0x101, &s0);

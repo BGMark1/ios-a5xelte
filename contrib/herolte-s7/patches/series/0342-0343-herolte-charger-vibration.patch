@@ -1,0 +1,414 @@
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index 8ce84d0..9bd8b50 100644
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -14,10 +14,25 @@
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/thread_call.h>
++#include <mach/mach_time.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int herolte_fg_init(void);
+ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah);
++int herolte_chg_state(bool *external, bool *charging, bool *full);
++bool herolte_pmic66_read(uint8_t reg, uint8_t *value);
++bool herolte_pmic66_write(uint8_t reg, uint8_t value);
++
++/*
++ * (0342) The MAX77854's MFD/charger page at 0x66 shares this bus with the gauge (Samsung: slave 0xcc, CHG_INT_OK
++ * 0xb2, CHG_DTLS_00/01 0xb3/0xb4, CNFG 0xb7-0xc6). One lock for every transfer on the bus.
++ */
++static LCK_GRP_DECLARE(fg_grp, "herolte_fg");
++static LCK_MTX_DECLARE(fg_mtx, &fg_grp);
++static uint32_t fg_target = 0x36u;
+ 
+ #define FG_HSI2C_PA     0x13650000u
+ #define FG_PINS_PA      0x136d0000u     /* GPI0 +0x00, GPD0 +0x20, GPD1 +0x40 */
+@@ -97,7 +112,7 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+ 
+ 	fg_wr(fg_i2c, HSI2C_INT_STAT, fg_rd(fg_i2c, HSI2C_INT_STAT));
+ 	fg_wr(fg_i2c, HSI2C_FIFO_CTL, 3u | (receive ? (1u << 4) : (1u << 16)));
+-	fg_wr(fg_i2c, HSI2C_ADDR, FG_ADDR << 10);
++	fg_wr(fg_i2c, HSI2C_ADDR, fg_target << 10);
+ 	fg_wr(fg_i2c, HSI2C_CTL, 9u | (receive ? 0x40u : 0x80u));
+ 	fg_wr(fg_i2c, HSI2C_INT_EN, 0xf80u | (receive ? 0x42u : 1u));
+ 	/* Bit 16 read, bit 17 STOP_AFTER_TRANS, bit 31 MASTER_RUN. */
+@@ -199,15 +214,23 @@ int
+ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
+ {
+ 	uint16_t soc, vcell, current, rem, full;
+-	if (!fg_i2c || !fg_word(FG_REPSOC, &soc) || !fg_word(FG_VCELL, &vcell) ||
+-	    !fg_word(FG_CURRENT, &current) || !fg_word(FG_REPCAP, &rem) ||
+-	    !fg_word(FG_FULLCAP, &full)) {
++	if (!fg_i2c) {
++		return -1;
++	}
++	lck_mtx_lock(&fg_mtx);
++	fg_target = FG_ADDR;
++	bool ok = fg_word(FG_REPSOC, &soc) && fg_word(FG_VCELL, &vcell) &&
++	    fg_word(FG_CURRENT, &current) && fg_word(FG_REPCAP, &rem) &&
++	    fg_word(FG_FULLCAP, &full);
++	uint16_t temp = 0;
++	bool temp_ok = ok && fg_word(0x08, &temp);
++	lck_mtx_unlock(&fg_mtx);
++	if (!ok) {
+ 		return -1;
+ 	}
+ 	/* (0330) TEMP 0x08: signed, 1/256 degree (the MAX17047 family's; Linux in TWRP read 30.6 C from it) */
+ 	extern volatile int herolte_fg_temp_dc;         /* bsd/dev/herolte_gpu.c, for the heat limit */
+-	uint16_t temp;
+-	if (fg_word(0x08, &temp)) {
++	if (temp_ok) {
+ 		herolte_fg_temp_dc = (int)(int16_t)temp * 10 / 256;
+ 	}
+ 	unsigned permille = ((unsigned)soc * 10u) >> 8;
+@@ -219,4 +242,245 @@ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, uns
+ 	*full_mah = full / 2u;
+ 	return 0;
+ }
++
++bool
++herolte_pmic66_read(uint8_t reg, uint8_t *value)
++{
++	if (!fg_i2c) {
++		return false;
++	}
++	lck_mtx_lock(&fg_mtx);
++	fg_target = 0x66u;
++	bool ok = false;
++	for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
++		ok = fg_message(false, &reg, 1, false) && fg_message(true, value, 1, true);
++	}
++	fg_target = FG_ADDR;
++	lck_mtx_unlock(&fg_mtx);
++	return ok;
++}
++
++bool
++herolte_pmic66_write(uint8_t reg, uint8_t value)
++{
++	if (!fg_i2c) {
++		return false;
++	}
++	uint8_t b[2] = { reg, value };
++	lck_mtx_lock(&fg_mtx);
++	fg_target = 0x66u;
++	bool ok = false;
++	for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
++		ok = fg_message(false, b, 2, true);
++	}
++	fg_target = FG_ADDR;
++	lck_mtx_unlock(&fg_mtx);
++	return ok;
++}
++
++/*
++ * Cable and charge state from the charger itself, not the gauge's current: CHGIN_OK (0xb2 bit 6) with CHGIN_DTLS
++ * (0xb3 [6:5]) 3 = valid VBUS; CHG_DTLS (0xb4 [3:0]) 0-2 charging, 3-4 top-off/done (Samsung counts both as full).
++ * The bootloader's configuration (CNFG_00 mode, CNFG_02 charge current in 50 mA, CNFG_09 input limit in 30 mA)
++ * is logged once and left as it is.
++ */
++int
++herolte_chg_state(bool *external, bool *charging, bool *full)
++{
++	uint8_t ok = 0, d0 = 0, d1 = 0;
++	if (!herolte_pmic66_read(0xb2, &ok) || !herolte_pmic66_read(0xb3, &d0) || !herolte_pmic66_read(0xb4, &d1)) {
++		return -1;
++	}
++	static uint8_t last_ok = 0xff, last_d1 = 0xff;
++	static unsigned logged;
++	if ((ok != last_ok || (d1 & 0x0f) != last_d1) && logged < 40) {
++		logged++;
++		uint8_t c0 = 0, c2 = 0, c9 = 0, c10 = 0, d2 = 0;
++		herolte_pmic66_read(0xb5, &d2);
++		herolte_pmic66_read(0xb7, &c0);
++		herolte_pmic66_read(0xb9, &c2);
++		herolte_pmic66_read(0xc0, &c9);
++		herolte_pmic66_read(0xc1, &c10);
++		printf("HEROLTE CHG: int_ok %#x dtls %#x/%#x/%#x cnfg_00 %#x, charge %u mA (cnfg_02 %#x), input %u mA (cnfg_09 %#x, cnfg_10 %#x)\n",
++		    ok, d0, d1, d2, c0, (c2 & 0x3fu) * 50u, c2, (c9 & 0x3fu) * 30u, c9, c10);
++		last_ok = ok;
++		last_d1 = d1 & 0x0f;
++	}
++	unsigned dtls = d1 & 0x0fu;
++	*external = (ok & 0x40u) != 0 && ((d0 >> 5) & 3u) == 3u;
++	*charging = *external && dtls <= 2;
++	*full = *external && (dtls == 3 || dtls == 4);
++	return 0;
++}
++
++/*
++ * (0343) The vibration motor, as Samsung's max77854_haptic.c with this phone's DTB (exynos8890-herolte_motor.dtsi):
++ * an LRA on the MAX77854's haptic driver, MCONFIG 0x10 = 0x82 (LRA, divider 128) and MOTOR_EN (bit 6) to run,
++ * BIASEN (MAINCTRL1 0x02 bit 7) once; its supply VDD_MOT_3.3V is the S2MPS16's LDO34 (L34CTRL 0x5e, enable [7:6]);
++ * the drive is PWM timer 1 of 0x136c0000 on GPD0-5 (function 2, pull-down), period 37950 ns, duty 32500 ns (the
++ * strongest; half the period is no force). herolte_vibrate(ms) runs it for ms (0: stop).
++ */
++#define HV_PWM_PA       0x136c0000u
++#define HV_GPD0         0x20
++#define HV_PERIOD_NS    37950u
++#define HV_DUTY_NS      32500u
++extern bool herolte_apm_pmic_read(uint8_t reg, uint8_t *value);
++extern bool herolte_apm_pmic_write(uint8_t reg, uint8_t value);
++void herolte_vibrate(uint32_t ms);
++static vm_offset_t hv_pwm;
++static uint64_t hv_tin_hz;
++static int hv_state;            /* 0 not set up, 1 ready, -1 failed */
++static thread_call_t hv_off_call;
++static LCK_MTX_DECLARE(hv_mtx, &fg_grp);
++
++static void
++hv_pwm_set(uint32_t duty_ns)
++{
++	uint32_t tcnt = (uint32_t)(hv_tin_hz * HV_PERIOD_NS / 1000000000ull);
++	uint32_t high = (uint32_t)(hv_tin_hz * duty_ns / 1000000000ull);
++	if (tcnt < 4) {
++		return;
++	}
++	if (high >= tcnt) {
++		high = tcnt - 1;
++	}
++	/* pwm-samsung.c: TCNTB = tcnt - 1, TCMPB = tcnt - 1 - high (the output is high while TCNT > TCMP) */
++	fg_wr(hv_pwm, 0x18, tcnt - 1);
++	fg_wr(hv_pwm, 0x1c, tcnt - 1 - high);
++}
++
++static bool
++hv_setup(void)
++{
++	uint8_t l34 = 0, v = 0;
++	if (!herolte_apm_pmic_read(0x5e, &l34)) {
++		return false;       /* the APM is not up yet */
++	}
++	hv_pwm = ml_io_map(HV_PWM_PA, 0x1000);
++	if (!hv_pwm || !fg_pins) {
++		hv_state = -1;
++		return false;
++	}
++	printf("HEROLTE VIB: LDO34 %#x, GPD0 con %#x pud %#x, PWM tcfg0 %#x tcfg1 %#x tcon %#x tcntb1 %#x tcmpb1 %#x\n", l34,
++	    fg_rd(fg_pins, HV_GPD0), fg_rd(fg_pins, HV_GPD0 + 8), fg_rd(hv_pwm, 0x00), fg_rd(hv_pwm, 0x04), fg_rd(hv_pwm, 0x08),
++	    fg_rd(hv_pwm, 0x18), fg_rd(hv_pwm, 0x1c));
++	/* GPD0-5: TOUT1 (function 2), pull-down */
++	fg_wr(fg_pins, HV_GPD0, (fg_rd(fg_pins, HV_GPD0) & ~(0xfu << 20)) | (2u << 20));
++	fg_wr(fg_pins, HV_GPD0 + 8, (fg_rd(fg_pins, HV_GPD0 + 8) & ~(3u << 10)) | (1u << 10));
++	/* timer 1: prescaler 0 (+1), divider 1/1; its input clock measured with a free count */
++	uint32_t tcon = fg_rd(hv_pwm, 0x08) & ~(0xfu << 8);
++	fg_wr(hv_pwm, 0x04, fg_rd(hv_pwm, 0x04) & ~(0xfu << 4));
++	uint32_t pre = fg_rd(hv_pwm, 0x00) & 0xffu;
++	fg_wr(hv_pwm, 0x18, 0xffffffffu);
++	fg_wr(hv_pwm, 0x1c, 0);
++	fg_wr(hv_pwm, 0x08, tcon | (1u << 9));
++	fg_wr(hv_pwm, 0x08, tcon | (1u << 8));
++	uint64_t t0 = mach_absolute_time();
++	uint32_t c0 = fg_rd(hv_pwm, 0x20);
++	delay(2000);
++	uint32_t c1 = fg_rd(hv_pwm, 0x20);
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	fg_wr(hv_pwm, 0x08, tcon);
++	hv_tin_hz = ns ? (uint64_t)(c0 - c1) * 1000000000ull / ns : 0;
++	printf("HEROLTE VIB: timer 1 counts %u in %llu ns (prescaler %u): %llu Hz\n", c0 - c1, ns, pre, hv_tin_hz);
++	if (hv_tin_hz < 1000000) {
++		printf("HEROLTE VIB: the PWM timer does not run, no vibration\n");
++		hv_state = -1;
++		return false;
++	}
++	/* idle drive: half the period (no force), auto-reload */
++	hv_pwm_set(HV_PERIOD_NS / 2);
++	fg_wr(hv_pwm, 0x08, tcon | (1u << 9) | (1u << 11));
++	fg_wr(hv_pwm, 0x08, tcon | (1u << 11));
++	/* the supply, then the haptic block (Samsung: 6 ms after the supply) */
++	if (!(l34 & 0xc0u) && !herolte_apm_pmic_write(0x5e, (uint8_t)(l34 | 0xc0u))) {
++		printf("HEROLTE VIB: LDO34 enable failed\n");
++		hv_state = -1;
++		return false;
++	}
++	delay(6000);
++	uint8_t main1 = 0, mcfg = 0;
++	bool ok = herolte_pmic66_read(0x02, &main1) && herolte_pmic66_write(0x02, (uint8_t)(main1 | 0x80u)) &&
++	    herolte_pmic66_read(0x10, &mcfg) && herolte_pmic66_write(0x10, 0x82u);
++	herolte_apm_pmic_read(0x5e, &v);
++	printf("HEROLTE VIB: LDO34 now %#x, MAINCTRL1 %#x -> %#x, MCONFIG %#x -> 0x82: %s\n", v, main1, main1 | 0x80u, mcfg,
++	    ok ? "ready" : "failed");
++	hv_state = ok ? 1 : -1;
++	return ok;
++}
++
++static void
++hv_off(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	lck_mtx_lock(&hv_mtx);
++	herolte_pmic66_write(0x10, 0x82u);
++	hv_pwm_set(HV_PERIOD_NS / 2);
++	fg_wr(hv_pwm, 0x08, fg_rd(hv_pwm, 0x08) & ~(1u << 8));
++	lck_mtx_unlock(&hv_mtx);
++}
++
++void
++herolte_vibrate(uint32_t ms)
++{
++	lck_mtx_lock(&hv_mtx);
++	if (hv_state == 0) {
++		hv_setup();
++	}
++	if (hv_state != 1) {
++		lck_mtx_unlock(&hv_mtx);
++		return;
++	}
++	if (!hv_off_call) {
++		hv_off_call = thread_call_allocate_with_options(hv_off, NULL, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
++	}
++	if (ms == 0) {
++		lck_mtx_unlock(&hv_mtx);
++		thread_call_cancel(hv_off_call);
++		hv_off(NULL, NULL);
++		return;
++	}
++	if (ms > 10000) {
++		ms = 10000;     /* haptic,max_timeout */
++	}
++	uint32_t tcon = fg_rd(hv_pwm, 0x08) & ~(0xfu << 8);
++	hv_pwm_set(HV_DUTY_NS);
++	fg_wr(hv_pwm, 0x08, tcon | (1u << 9) | (1u << 11));
++	fg_wr(hv_pwm, 0x08, tcon | (1u << 8) | (1u << 11));
++	herolte_pmic66_write(0x10, 0x82u | 0x40u);
++	lck_mtx_unlock(&hv_mtx);
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	thread_call_enter_delayed(hv_off_call, deadline);
++}
++
++/* Boot-arg herovib=N: once the APM answers, three pulses of N ms, a second apart (a hardware check). */
++static void
++hv_boot_test(void *arg, __unused wait_result_t w)
++{
++	uint32_t ms = (uint32_t)(uintptr_t)arg;
++	uint8_t id = 0;
++	for (unsigned i = 0; i < 120 && !herolte_apm_pmic_read(0x00, &id); i++) {
++		delay(500000);
++	}
++	delay(20000000);        /* past the boot logo, so it can be felt on its own */
++	for (unsigned i = 0; i < 3; i++) {
++		printf("HEROLTE VIB: test pulse %u, %u ms\n", i + 1, ms);
++		herolte_vibrate(ms);
++		delay(1000000);
++	}
++	printf("HEROLTE VIB: test done (state %d)\n", hv_state);
++}
++
++void herolte_vib_init(void);
++void
++herolte_vib_init(void)
++{
++	uint32_t ms = 0;
++	thread_t thread;
++	if (PE_parse_boot_argn("herovib", &ms, sizeof(ms)) && ms != 0 &&
++	    kernel_thread_start(hv_boot_test, (void *)(uintptr_t)ms, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_HEROLTE */
+diff --git a/bsd/dev/herolte_touch.c b/bsd/dev/herolte_touch.c
+index a2772e1..125567f 100644
+--- a/bsd/dev/herolte_touch.c
++++ b/bsd/dev/herolte_touch.c
+@@ -15,6 +15,7 @@
+  * Boot-arg herotouch=0 disables everything here.
+  */
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <kern/locks.h>
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+@@ -410,9 +411,27 @@ apm_start(void)
+ 	return true;
+ }
+ 
+-/* samsung_mbox_send_data() + samsung_mbox_last_tx_done(), polled. */
++/*
++ * (0343) One message at a time: the touch power-on, the clock code's voltages (herolte_gpu.c) and the vibration
++ * motor's LDO34 all use this mailbox, and two senders' TX_MSG words interleaved would write one PMIC register with
++ * another's value.
++ */
++static LCK_GRP_DECLARE(apm_grp, "herolte_apm");
++static LCK_MTX_DECLARE(apm_mtx, &apm_grp);
++static bool apm_message_locked(uint32_t msg0, uint32_t msg1, uint32_t msg2, uint32_t *reply);
++
+ static bool
+ apm_message(uint32_t msg0, uint32_t msg1, uint32_t msg2, uint32_t *reply)
++{
++	lck_mtx_lock(&apm_mtx);
++	bool ok = apm_message_locked(msg0, msg1, msg2, reply);
++	lck_mtx_unlock(&apm_mtx);
++	return ok;
++}
++
++/* samsung_mbox_send_data() + samsung_mbox_last_tx_done(), polled. */
++static bool
++apm_message_locked(uint32_t msg0, uint32_t msg1, uint32_t msg2, uint32_t *reply)
+ {
+ 	unsigned n;
+ 	for (n = 0; n < 10000 && ((ht_rd(apm_mbox, MBOX_RX_IRQ0) & 1u) ||
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 6d8a0fd..d5e2997 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,8 @@
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ /* bsd/dev/herolte_battery.c: MAX77854 fuel gauge, read-only. */
+ extern "C" int herolte_fg_init(void);
++extern "C" int herolte_chg_state(bool *external, bool *charging, bool *full);
++extern "C" void herolte_vib_init(void);
+ extern "C" int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma,
+     unsigned *rem_mah, unsigned *full_mah);
+ #define BATTERY_DESIGN_MAH 3000u        /* SM-G930F EB-BG930ABE */
+@@ -230,14 +232,20 @@ SweetBattery::poll(void)
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
+ 	}
+-	/* No charger driver: the gauge's charge current marks a cable. */
+-	bool charging = ma > 20;
++	/* (0342) The charger's own state; without an answer, the gauge's charge current marks a cable. */
++	bool external = ma > 20, charging = ma > 20, isFull = false;
++	bool e = false, c = false, f = false;
++	if (herolte_chg_state(&e, &c, &f) == 0) {
++		external = e;
++		charging = c;
++		isFull = f;
++	}
+ 	static unsigned logged;
+ 	if (logged++ % 10 == 0) {
+-		IOLog("SWEET BATTERY: %u%% %umV %dmA rem=%umAh full=%umAh\n",
+-		    percent, mv, ma, rem, full);
++		IOLog("SWEET BATTERY: %u%% %umV %dmA rem=%umAh full=%umAh external=%d charging=%d done=%d\n",
++		    percent, mv, ma, rem, full, external, charging, isFull);
+ 	}
+-	publish(percent, mv, ma, charging, charging, charging, false, true, true);
++	publish(isFull && percent >= 95 ? 100 : percent, mv, ma, external, external, charging, isFull, true, true);
+ }
+ #else
+ void
+@@ -290,7 +298,11 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		sender->setTimeoutMS(10000);
++#else
+ 		sender->setTimeoutMS(30000);
++#endif
+ 	}
+ }
+ 
+@@ -303,6 +315,7 @@ SweetBattery::start(IOService *provider)
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	/* Default on; herofg=0 keeps the static fallback. */
+ 	fReal = herolte_fg_init() == 0;
++	herolte_vib_init();
+ #else
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));

@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 7b2d7d0..3a75c1e 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -3134,7 +3134,7 @@ hero_dsim_read(vm_offset_t dsim, uint8_t reg, uint8_t *data, unsigned count)
+ 	}
+ 	hg_wr(dsim, HERO_DSIM_PKTHDR, 0x06u | ((uint32_t)reg << 8)); /* DCS read, automatic turnaround */
+ 	const bool done = hero_dsim_wait(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
+-	uint32_t first = 0, unexpected = 0;
++	uint32_t first = 0, unexpected = 0, error_report = 0;
+ 	unsigned received = 0;
+ 	bool bad = false;
+ 	for (unsigned i = 0; i < 64 && !(hg_rd(dsim, HERO_DSIM_FIFOCTRL) & HERO_DSIM_RX_EMPTY); i++) {
+@@ -3162,7 +3162,11 @@ hero_dsim_read(vm_offset_t dsim, uint8_t reg, uint8_t *data, unsigned count)
+ 					data[received++] = (uint8_t)(word >> (8 * k));
+ 				}
+ 			}
+-		} else if (type != 0x08 && (type != 0x02 || ((hdr >> 8) & 0xffff) != 0)) {
++		} else if (type == 0x02) {
++			/* (0335) Acknowledge and error report: the S6E3HA3 sends one after its reply
++			 * (0x13800402: ECC corrected, protocol violation). Linux only logs these. */
++			error_report = (hdr >> 8) & 0xffff;
++		} else if (type != 0x08) {
+ 			unexpected = hdr;
+ 			bad = true;
+ 			break;
+@@ -3170,6 +3174,9 @@ hero_dsim_read(vm_offset_t dsim, uint8_t reg, uint8_t *data, unsigned count)
+ 	}
+ 	const uint32_t final_fifo = hg_rd(dsim, HERO_DSIM_FIFOCTRL);
+ 	hg_wr(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
++	if (error_report) {
++		printf("HEROLTE PANEL: DCS %#x reply with error report %#x (ignored)\n", reg, error_report);
++	}
+ 	if (done && received == count && !bad && (final_fifo & HERO_DSIM_RX_EMPTY)) {
+ 		return true;
+ 	}

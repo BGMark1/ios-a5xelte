@@ -1,0 +1,184 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2867,6 +2867,7 @@
+ #define HERO_DSIM_STATUS 0x08
+ #define HERO_DSIM_INTSRC 0x34
+ #define HERO_DSIM_PKTHDR 0x3c
++#define HERO_DSIM_PAYLOAD 0x40
+ #define HERO_DSIM_RXFIFO 0x44
+ #define HERO_DSIM_FIFOCTRL 0x4c
+ #define HERO_DSIM_CMD_CONFIG 0x78
+@@ -2891,54 +2892,150 @@
+ 	return true;
+ }
+ 
+-/* DCS Get Display ID (0x04). This issues a read only; no vendor keys or dimming commands. */
+-static void
+-hero_dsim_panel_id(vm_offset_t dsim)
++/* Read one long DCS response of the requested size, with no pre-existing FIFO data. */
++static bool
++hero_dsim_read(vm_offset_t dsim, uint8_t reg, uint8_t *data, unsigned count)
+ {
+ 	const uint32_t fifo = hg_rd(dsim, HERO_DSIM_FIFOCTRL);
+ 	const uint32_t status = hg_rd(dsim, HERO_DSIM_STATUS);
+ 	const uint32_t config = hg_rd(dsim, HERO_DSIM_CMD_CONFIG);
+ 	if (!(status & HERO_DSIM_HS_READY) || (config & HERO_DSIM_PACKETGO) ||
+ 	    (fifo & (HERO_DSIM_PH_EMPTY | HERO_DSIM_RX_EMPTY)) != (HERO_DSIM_PH_EMPTY | HERO_DSIM_RX_EMPTY)) {
+-		printf("HEROLTE PANEL: ID skipped, DSIM status %#x fifo %#x cmd config %#x\n", status, fifo, config);
+-		return;
++		printf("HEROLTE PANEL: read %#x skipped, DSIM status %#x fifo %#x cmd config %#x\n", reg, status, fifo, config);
++		return false;
+ 	}
+ 
+ 	hg_wr(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
+-	hg_wr(dsim, HERO_DSIM_PKTHDR, 0x37u | (3u << 8)); /* Maximum return packet size, 3 bytes */
++	hg_wr(dsim, HERO_DSIM_PKTHDR, 0x37u | (count << 8)); /* Maximum return packet size */
+ 	if (!hero_dsim_wait(dsim, HERO_DSIM_FIFOCTRL, HERO_DSIM_PH_EMPTY)) {
+ 		printf("HEROLTE PANEL: DSIM did not send maximum return packet size\n");
+-		return;
+-	}
+-	hg_wr(dsim, HERO_DSIM_PKTHDR, 0x06u | (0x04u << 8)); /* DCS read, bus turnaround by packet type */
++		return false;
++	}
++	hg_wr(dsim, HERO_DSIM_PKTHDR, 0x06u | ((uint32_t)reg << 8)); /* DCS read, automatic turnaround */
+ 	const bool done = hero_dsim_wait(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
+-	uint32_t id = 0, first = 0;
+-	bool found = false, bad = false;
++	uint32_t first = 0;
++	unsigned received = 0;
++	bool bad = false;
+ 	for (unsigned i = 0; i < 64 && !(hg_rd(dsim, HERO_DSIM_FIFOCTRL) & HERO_DSIM_RX_EMPTY); i++) {
+ 		const uint32_t hdr = hg_rd(dsim, HERO_DSIM_RXFIFO);
++		const uint32_t type = hdr & 0x3f;
+ 		if (i == 0) {
+ 			first = hdr;
+ 		}
+-		if ((hdr & 0x3f) == 0x1c || (hdr & 0x3f) == 0x1a) { /* DCS or generic long response */
+-			const uint32_t size = (hdr >> 8) & 0xffff;
+-			if (size != 3 || found || (hg_rd(dsim, HERO_DSIM_FIFOCTRL) & HERO_DSIM_RX_EMPTY)) {
++		if (type == 0x1c || type == 0x1a) { /* DCS or generic long response */
++			if (((hdr >> 8) & 0xffff) != count || received != 0) {
+ 				bad = true;
+ 				break;
+ 			}
+-			id = hg_rd(dsim, HERO_DSIM_RXFIFO);
+-			i++;
+-			found = true;
+-		} else if ((hdr & 0x3f) != 0x08 && ((hdr & 0x3f) != 0x02 || ((hdr >> 8) & 0xffff) != 0)) {
++			for (unsigned j = 0; j < count && i + 1 < 64; j += 4) {
++				if (hg_rd(dsim, HERO_DSIM_FIFOCTRL) & HERO_DSIM_RX_EMPTY) {
++					break;
++				}
++				const uint32_t word = hg_rd(dsim, HERO_DSIM_RXFIFO);
++				i++;
++				for (unsigned k = 0; k < 4 && j + k < count; k++) {
++					data[received++] = (uint8_t)(word >> (8 * k));
++				}
++			}
++		} else if (type != 0x08 && (type != 0x02 || ((hdr >> 8) & 0xffff) != 0)) {
+ 			bad = true;
+ 			break;
+ 		}
+ 	}
+-	const uint32_t after = hg_rd(dsim, HERO_DSIM_FIFOCTRL);
++	const uint32_t final_fifo = hg_rd(dsim, HERO_DSIM_FIFOCTRL);
+ 	hg_wr(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
+-	if (found && !bad && (after & HERO_DSIM_RX_EMPTY)) {
+-		printf("HEROLTE PANEL: DCS ID %02x%02x%02x\n", id & 0xff, (id >> 8) & 0xff, (id >> 16) & 0xff);
++	if (received == count && !bad && (final_fifo & HERO_DSIM_RX_EMPTY)) {
++		return true;
++	}
++	printf("HEROLTE PANEL: no valid DCS %#x reply (got %u done %u first %#x fifo %#x)\n",
++	    reg, received, (unsigned)done, first, final_fifo);
++	return false;
++}
++
++/* Exynos8890 sends a 2-byte DCS command as short-with-parameter (0x15). */
++static bool
++hero_dsim_write(vm_offset_t dsim, const uint8_t *data, unsigned count)
++{
++	if (!(hg_rd(dsim, HERO_DSIM_STATUS) & HERO_DSIM_HS_READY) ||
++	    (hg_rd(dsim, HERO_DSIM_CMD_CONFIG) & HERO_DSIM_PACKETGO) ||
++	    !hero_dsim_wait(dsim, HERO_DSIM_FIFOCTRL, HERO_DSIM_PH_EMPTY)) {
++		return false;
++	}
++	if (count == 2) {
++		hg_wr(dsim, HERO_DSIM_PKTHDR, 0x15u | (uint32_t)data[0] << 8 | (uint32_t)data[1] << 16);
+ 	} else {
+-		printf("HEROLTE PANEL: no valid DCS ID (done %u first %#x fifo %#x)\n", (unsigned)done, first, after);
++		for (unsigned i = 0; i < count; i += 4) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < 4 && i + j < count; j++) {
++				word |= (uint32_t)data[i + j] << (8 * j);
++			}
++			hg_wr(dsim, HERO_DSIM_PAYLOAD, word);
++		}
++		hg_wr(dsim, HERO_DSIM_PKTHDR, 0x39u | count << 8);
++	}
++	return hero_dsim_wait(dsim, HERO_DSIM_FIFOCTRL, HERO_DSIM_PH_EMPTY);
++}
++
++static bool
++hero_dsim_apply_aor(vm_offset_t dsim, const uint8_t aor[11])
++{
++	const uint8_t update[] = { 0xf7, 0x03 }, update_end[] = { 0xf7, 0x00 };
++	return hero_dsim_write(dsim, aor, 11) && hero_dsim_write(dsim, update, sizeof(update)) &&
++	       hero_dsim_write(dsim, update_end, sizeof(update_end));
++}
++
++/* One reversible test on the TWRP-identified HA3 daisy. Gamma and voltages stay as inherited. */
++static void
++hero_dsim_aor_trial(vm_offset_t dsim)
++{
++	const uint8_t open_f0[] = { 0xf0, 0x5a, 0x5a }, open_fc[] = { 0xfc, 0x5a, 0x5a };
++	const uint8_t close_fc[] = { 0xfc, 0xa5, 0xa5 }, close_f0[] = { 0xf0, 0xa5, 0xa5 };
++	/* Stock HA3 B1 prefix, followed by the stock daisy AOR for index 128. */
++	const uint8_t test[] = { 0xb1, 0x54, 0x20, 0x1a, 0x33, 0x5e, 0x8c, 0xb3, 0xd9, 0x30, 0x61 };
++	uint8_t original[sizeof(test)] = { 0xb1 };
++	if (hero_dsim_write(dsim, open_f0, sizeof(open_f0)) &&
++	    hero_dsim_write(dsim, open_fc, sizeof(open_fc)) &&
++	    hero_dsim_read(dsim, 0xb1, original + 1, sizeof(original) - 1) &&
++	    memcmp(test, original, sizeof(test) - 2) == 0) {
++		if (memcmp(test, original, sizeof(test)) == 0) {
++			printf("HEROLTE PANEL: AOR trial skipped, bootloader already set the trial value\n");
++		} else {
++			printf("HEROLTE PANEL: inherited AOR %02x%02x, trying stock index 128 for 2 s\n",
++			    original[9], original[10]);
++			const bool sent = hero_dsim_apply_aor(dsim, test);
++			if (sent) {
++				hg_msleep(2000);
++			}
++			/* An unsuccessful latch can still follow a submitted B1 write. Always restore. */
++			const bool restored = hero_dsim_apply_aor(dsim, original);
++			uint8_t readback[sizeof(original) - 1];
++			const bool verified = restored && hero_dsim_read(dsim, 0xb1, readback, sizeof(readback)) &&
++			    memcmp(original + 1, readback, sizeof(readback)) == 0;
++			printf("HEROLTE PANEL: AOR trial sent %u, original sent %u, restore verified %u\n",
++			    (unsigned)sent, (unsigned)restored, (unsigned)verified);
++		}
++	} else {
++		printf("HEROLTE PANEL: AOR trial skipped, inherited B1 could not be verified\n");
++	}
++	const bool closed_fc = hero_dsim_write(dsim, close_fc, sizeof(close_fc));
++	const bool closed_f0 = hero_dsim_write(dsim, close_f0, sizeof(close_f0));
++	if (!closed_fc || !closed_f0) {
++		printf("HEROLTE PANEL: failed to relock vendor command keys\n");
++	}
++}
++
++static void
++hero_dsim_panel_id(vm_offset_t dsim)
++{
++	uint8_t id[3];
++	if (!hero_dsim_read(dsim, 0x04, id, sizeof(id))) {
++		return;
++	}
++	printf("HEROLTE PANEL: DCS ID %02x%02x%02x\n", id[0], id[1], id[2]);
++	int dim = 0;
++	if (id[0] == 0 && id[1] == 0x40 && id[2] == 0x44 &&
++	    PE_parse_boot_argn("heropaneldim", &dim, sizeof(dim)) && dim == 1) {
++		hero_dsim_aor_trial(dsim);
+ 	}
+ }
+ 

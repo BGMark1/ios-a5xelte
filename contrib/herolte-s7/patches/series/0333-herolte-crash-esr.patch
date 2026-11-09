@@ -1,0 +1,20 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 76d70b9..4a37877 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -876,6 +876,15 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 	if (sig == 11 || sig == 10) {
+ 		/* Which mapping the faulting address is in, or which two it falls between. */
+ 		uint64_t far = (uint64_t)saved_state64(ss)->far;
++		{
++			/* HEROLTE: fault syndrome and the physical page behind far, for SIGBUS that is not a VM fault. */
++			extern unsigned int pmap_cache_attributes(ppnum_t pn);
++			uint32_t esr = (uint32_t)saved_state64(ss)->esr;
++			ppnum_t pn = pmap_find_phys(current_map()->pmap, (addr64_t)(far & ~(uint64_t)PAGE_MASK));
++			printf("CRASH %s esr 0x%x ec 0x%x fsc 0x%x wnr %u pa 0x%llx managed %d wimg 0x%x\n", name,
++			    esr, esr >> 26, esr & 0x3f, (esr >> 6) & 1, (unsigned long long)ptoa_64(pn) | (far & (uint64_t)PAGE_MASK),
++			    pn ? (int)pmap_valid_page(pn) : -1, pn && pmap_valid_page(pn) ? pmap_cache_attributes(pn) : 0xffffffffu);
++		}
+ 		vm_map_t map = current_map();
+ 		vm_map_entry_t entry;
+ 		vm_map_lock_read(map);

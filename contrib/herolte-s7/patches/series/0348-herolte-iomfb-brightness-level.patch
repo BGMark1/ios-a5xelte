@@ -1,0 +1,73 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f941f6f..9da78c9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,7 @@ extern "C" uint64_t a5xelte_power_pressed_at;   /* bsd/dev/a5xelte_keys.c */
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+@@ -187,9 +188,13 @@ public:
+ 	uint64_t      fFadeWork;
+ 	uint32_t      fBrightnessTraceBudget; /* protected by fLock */
+ 	bool          fBrightnessTrace;
++	uint32_t      fBrightLogged;
+ #endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++#endif
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -226,6 +231,46 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * (0348) iOS 16's CoreBrightness sets the panel level with IORegistryEntrySetCFProperty(<IOMobileFramebuffer>,
++ * "IOMFBBrightnessLevel", CFNumber) (CoreBrightness 0x1af016810). Without setProperties here IOService answered
++ * kIOReturnUnsupported. The level is kept (readable as the same property, and herolte_bright_level for the panel code)
++ * and logged: the first 24 values, then every change of more than 1/16 of the last one.
++ */
++extern "C" volatile uint32_t herolte_bright_level;
++volatile uint32_t herolte_bright_level;
++
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *level = OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel"));
++	if (!level) {
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++		OSSymbol *key = it ? OSDynamicCast(OSSymbol, it->getNextObject()) : NULL;
++		if (fBrightLogged < 64) {
++			fBrightLogged++;
++			IOLog("SWEET FB: setProperties %s (%u keys) unsupported\n", key ? key->getCStringNoCopy() : "?", d->getCount());
++		}
++		OSSafeReleaseNULL(it);
++		return kIOReturnUnsupported;
++	}
++	uint32_t v = level->unsigned32BitValue(), last = herolte_bright_level;
++	uint32_t diff = v > last ? v - last : last - v;
++	if (fBrightLogged < 24 || diff > last / 16) {
++		fBrightLogged++;
++		IOLog("SWEET FB: IOMFBBrightnessLevel %u (%#x, %u bits)\n", v, v, level->numberOfBits());
++	}
++	herolte_bright_level = v;
++	setProperty("IOMFBBrightnessLevel", level);
++	return kIOReturnSuccess;
++}
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {

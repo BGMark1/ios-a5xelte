@@ -1,0 +1,121 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9da78c9..8f5d1eb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -271,6 +271,91 @@ AppleCLCD::setProperties(OSObject *properties)
+ }
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * (0349) CoreBrightness (BCAppleBacklightBrtControl) finds its backlight with IOServiceGetMatchingServices(
++ * { IOPropertyMatch: { backlight-control: ... } }) and reads IODisplayParameters (brightness, BrightnessMilliNits),
++ * MinNits/MaxNits and optional nits tables from it. Nothing here had that property, so the brightness system had no
++ * backlight. Boot-arg herobacklight=1: a service with those properties, logging every property set it receives.
++ * No panel write yet.
++ */
++class SweetBacklight : public IOService {
++	OSDeclareDefaultStructors(SweetBacklight);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	bool setupParameters(void);
++	uint32_t fLogged;
++};
++OSDefineMetaClassAndStructors(SweetBacklight, IOService);
++
++static OSDictionary *
++sweet_backlight_param(uint32_t min, uint32_t max, uint32_t value)
++{
++	OSDictionary *d = OSDictionary::withCapacity(3);
++	OSNumber *a = OSNumber::withNumber(min, 32), *b = OSNumber::withNumber(max, 32), *c = OSNumber::withNumber(value, 32);
++	if (d && a && b && c) {
++		d->setObject("min", a);
++		d->setObject("max", b);
++		d->setObject("value", c);
++	}
++	OSSafeReleaseNULL(a);
++	OSSafeReleaseNULL(b);
++	OSSafeReleaseNULL(c);
++	return d;
++}
++
++bool
++SweetBacklight::setupParameters(void)
++{
++	OSDictionary *params = OSDictionary::withCapacity(2);
++	OSDictionary *brightness = sweet_backlight_param(0, 65536, 32768);
++	OSDictionary *millinits = sweet_backlight_param(2000, 500000, 250000);
++	bool ok = params && brightness && millinits;
++	if (ok) {
++		params->setObject("brightness", brightness);
++		params->setObject("BrightnessMilliNits", millinits);
++		setProperty("IODisplayParameters", params);
++		setProperty("backlight-control", true);
++		setProperty("MinNits", 2ULL, 32);
++		setProperty("MaxNits", 500ULL, 32);
++		setProperty("MaxNitsPanel", 500ULL, 32);
++		setProperty("user-accessible-max-nits", 500ULL, 32);
++	}
++	OSSafeReleaseNULL(params);
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(millinits);
++	return ok;
++}
++
++IOReturn
++SweetBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	if (fLogged < 200) {
++		fLogged++;
++		OSSerialize *ser = OSSerialize::withCapacity(256);
++		if (ser && d->serialize(ser)) {
++			IOLog("SWEET BACKLIGHT: set %.400s\n", ser->text());
++		}
++		OSSafeReleaseNULL(ser);
++	}
++	/* keep what was set readable, as a backlight driver would */
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++	for (OSSymbol *key = it ? OSDynamicCast(OSSymbol, it->getNextObject()) : NULL; key;
++	    key = OSDynamicCast(OSSymbol, it->getNextObject())) {
++		OSNumber *n = OSDynamicCast(OSNumber, d->getObject(key));
++		if (n) {
++			setProperty(key, n);
++		}
++	}
++	OSSafeReleaseNULL(it);
++	return kIOReturnSuccess;
++}
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -451,6 +536,24 @@ AppleCLCD::start(IOService *provider)
+ 	{
+ 		setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	{
++		int backlight = 0;
++		if (PE_parse_boot_argn("herobacklight", &backlight, sizeof(backlight)) && backlight == 1) {
++			SweetBacklight *bl = OSTypeAlloc(SweetBacklight);
++			if (bl && bl->init() && bl->setupParameters() && bl->attach(this)) {
++				bl->setName("backlight");
++				if (bl->start(this)) {
++					bl->registerService();
++					IOLog("SWEET BACKLIGHT: registered (backlight-control)\n");
++				} else {
++					bl->detach(this);
++				}
++			}
++			OSSafeReleaseNULL(bl);
++		}
++	}
++#endif
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);

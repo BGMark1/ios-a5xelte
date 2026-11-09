@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2994,6 +2994,19 @@
+ 	printf("HEROSWIPE END\n");
+ }
+ 
++/* Optional test input in physical panel coordinates. */
++static void
++hg_cc_drag(unsigned x, unsigned start, unsigned end)
++{
++	extern void sweet_hid_touch(int, int, int, int);
++	for (unsigned step = 0; step <= 15; step++) {
++		unsigned y = (start * (15 - step) + end * step) / 15;
++		sweet_hid_touch(9, 1, x, y);
++		hg_msleep(30);
++	}
++	sweet_hid_touch(9, 0, x, end);
++}
++
+ /*
+  * Boot-arg herotwrp=SECONDS: after that long the phone restarts into recovery by itself, as Samsung's sec_reboot does
+  * for "reboot recovery", so that a test runs with nobody at the buttons. The log has its last flush first.
+@@ -3011,6 +3024,26 @@
+ 			sweet_hid_key(3, 0);
+ 			printf("HEROCAP: sent Home press\n");
+ 			hg_msleep(4000);
++			uint32_t cc = 0;
++			if (PE_parse_boot_argn("herocc", &cc, sizeof(cc)) && (cc == 1 || cc == 2)) {
++				printf("HEROCC: opening from bottom edge\n");
++				hg_cc_drag(HG_PANEL_W / 2, HG_PANEL_H - 4, HG_PANEL_H * 3 / 5);
++				hg_msleep(3500);
++				if (cc == 2) {
++					uint32_t x = 0, top = 0, bottom = 0;
++					PE_parse_boot_argn("ccx", &x, sizeof(x));
++					PE_parse_boot_argn("cctop", &top, sizeof(top));
++					PE_parse_boot_argn("ccbot", &bottom, sizeof(bottom));
++					if (x > 0 && x < HG_PANEL_W && top > 0 && top < bottom && bottom < HG_PANEL_H) {
++						printf("HEROCC: brightness down at %u, %u..%u\n", x, top, bottom);
++						hg_cc_drag(x, top, bottom);
++						hg_msleep(1500);
++						printf("HEROCC: brightness up\n");
++						hg_cc_drag(x, bottom, top);
++						hg_msleep(1500);
++					}
++				}
++			}
+ 			uint32_t lock = 0;
+ 			if (PE_parse_boot_argn("herolock", &lock, sizeof(lock)) && lock == 1) {
+ 				printf("HEROLOCK: pressing Power to lock\n");

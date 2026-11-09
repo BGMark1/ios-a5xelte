@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2913,11 +2913,15 @@
+ 	}
+ 	hg_wr(dsim, HERO_DSIM_PKTHDR, 0x06u | ((uint32_t)reg << 8)); /* DCS read, automatic turnaround */
+ 	const bool done = hero_dsim_wait(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
+-	uint32_t first = 0;
++	uint32_t first = 0, unexpected = 0;
+ 	unsigned received = 0;
+ 	bool bad = false;
+ 	for (unsigned i = 0; i < 64 && !(hg_rd(dsim, HERO_DSIM_FIFOCTRL) & HERO_DSIM_RX_EMPTY); i++) {
+ 		const uint32_t hdr = hg_rd(dsim, HERO_DSIM_RXFIFO);
++		/* Samsung DSIM returns this value when the FIFO is drained. */
++		if (hdr == 0x30800002u) {
++			break;
++		}
+ 		const uint32_t type = hdr & 0x3f;
+ 		if (i == 0) {
+ 			first = hdr;
+@@ -2938,17 +2942,18 @@
+ 				}
+ 			}
+ 		} else if (type != 0x08 && (type != 0x02 || ((hdr >> 8) & 0xffff) != 0)) {
++			unexpected = hdr;
+ 			bad = true;
+ 			break;
+ 		}
+ 	}
+ 	const uint32_t final_fifo = hg_rd(dsim, HERO_DSIM_FIFOCTRL);
+ 	hg_wr(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
+-	if (received == count && !bad && (final_fifo & HERO_DSIM_RX_EMPTY)) {
++	if (done && received == count && !bad && (final_fifo & HERO_DSIM_RX_EMPTY)) {
+ 		return true;
+ 	}
+-	printf("HEROLTE PANEL: no valid DCS %#x reply (got %u done %u first %#x fifo %#x)\n",
+-	    reg, received, (unsigned)done, first, final_fifo);
++	printf("HEROLTE PANEL: no valid DCS %#x reply (got %u done %u first %#x unexpected %#x fifo %#x)\n",
++	    reg, received, (unsigned)done, first, unexpected, final_fifo);
+ 	return false;
+ }
+ 

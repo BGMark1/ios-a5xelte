@@ -1,0 +1,114 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 08c8906..40627ad 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2041,6 +2041,9 @@ herolte_gpu_unmap(uint64_t va, unsigned n)
+  * tiler, compute) on all shader cores and wait (bounded). Returns 0 when
+  * it finished cleanly, else JS_STATUS (or ~0 if it never ran); *us = time.
+  */
++/* (0340) all clients' job time, for the framebuffer's per-frame statistics */
++volatile uint64_t herolte_gpu_busy_us;
++
+ uint32_t
+ herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us)
+ {
+@@ -2060,8 +2063,10 @@ herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us)
+ 		hg_job_va = HG_TEST_VA;
+ 		hg_affinity = 1;
+ 		status = ok ? 0 : (hg_last_js_status ? hg_last_js_status : ~0u);
++		uint64_t took = hg_us_since(start);
++		herolte_gpu_busy_us += took;
+ 		if (us) {
+-			*us = hg_us_since(start);
++			*us = took;
+ 		}
+ 	}
+ 	lck_mtx_unlock(hg_mtx);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index dee3a8c..f941f6f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -77,6 +77,14 @@ extern "C" bool herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, u
+ extern "C" bool herolte_fb_two_buffers(void);
+ extern "C" void herolte_fb_primary(void);
+ extern "C" volatile uint64_t herolte_screen_off_at;    /* bsd/dev/herolte_gpu.c (0330) */
++/*
++ * (0340) Frame timing as the window server delivers it: for every swap the time since the vsync tick before it
++ * (CoreAnimation starts a frame on a tick), since the swap before it, and the GPU job time in between.
++ */
++extern "C" volatile uint64_t herolte_gpu_busy_us;
++static volatile uint64_t sweet_fb_tick_at;
++static uint64_t sweet_fb_prev_swap_at, sweet_fb_gpu_at_swap, sweet_fb_lat_sum_us, sweet_fb_lat_max_us, sweet_fb_timed;
++static uint32_t sweet_fb_lat[7], sweet_fb_int[6], sweet_fb_gpu[6];
+ #endif
+ 
+ enum {
+@@ -507,6 +515,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = fb->fVsyncNext ? fb->fVsyncNext : mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_fb_tick_at = mach_absolute_time();
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -626,6 +635,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			    fb->fPerfNS / fb->fPerfFrames / 1000, fb->fPerfMaxNS / 1000, fb->fVsyncMissed,
+ 			    fb->fGaps[0], fb->fGaps[1], fb->fGaps[2], fb->fGaps[3], fb->fSwaps, fb->fOverwritten, fb->fVblSent);
+ 		}
++		if (sweet_fb_timed != 0) {
++			IOLog("HEROLTE FRAME: after tick ms <4/<8/<12/<16/<20/<33/33+ %u/%u/%u/%u/%u/%u/%u avg %llu us max %llu us"
++			    " | swap to swap <12/<18/<25/<35/<50/50+ %u/%u/%u/%u/%u/%u | gpu ms <1/<2/<4/<8/<16/16+ %u/%u/%u/%u/%u/%u\n",
++			    sweet_fb_lat[0], sweet_fb_lat[1], sweet_fb_lat[2], sweet_fb_lat[3], sweet_fb_lat[4], sweet_fb_lat[5],
++			    sweet_fb_lat[6], sweet_fb_lat_sum_us / sweet_fb_timed, sweet_fb_lat_max_us,
++			    sweet_fb_int[0], sweet_fb_int[1], sweet_fb_int[2], sweet_fb_int[3], sweet_fb_int[4], sweet_fb_int[5],
++			    sweet_fb_gpu[0], sweet_fb_gpu[1], sweet_fb_gpu[2], sweet_fb_gpu[3], sweet_fb_gpu[4], sweet_fb_gpu[5]);
++		}
++		bzero(sweet_fb_lat, sizeof(sweet_fb_lat));
++		bzero(sweet_fb_int, sizeof(sweet_fb_int));
++		bzero(sweet_fb_gpu, sizeof(sweet_fb_gpu));
++		sweet_fb_lat_sum_us = sweet_fb_lat_max_us = sweet_fb_timed = 0;
+ 		bzero(fb->fGaps, sizeof(fb->fGaps));
+ 		fb->fSwaps = fb->fOverwritten = fb->fVblSent = 0;
+ 		fb->fPerfFrames = fb->fPerfBytes = fb->fPerfNS = fb->fPerfMaxNS = 0;
+@@ -784,6 +805,41 @@ sweet_fb_copy_rows(uintptr_t dst, uint64_t dstStride, uintptr_t src, uint64_t sr
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	{
++		uint64_t t = mach_absolute_time(), lat = 0, gap = 0;
++		uint64_t gpu = herolte_gpu_busy_us, g = gpu - sweet_fb_gpu_at_swap;
++		sweet_fb_gpu_at_swap = gpu;
++		if (sweet_fb_tick_at != 0 && t >= sweet_fb_tick_at) {
++			absolutetime_to_nanoseconds(t - sweet_fb_tick_at, &lat);
++			lat /= 1000;
++			static const uint64_t lb[6] = { 4000, 8000, 12000, 16000, 20000, 33000 };
++			unsigned i = 0;
++			while (i < 6 && lat >= lb[i]) {
++				i++;
++			}
++			sweet_fb_lat[i]++;
++			sweet_fb_lat_sum_us += lat;
++			sweet_fb_lat_max_us = lat > sweet_fb_lat_max_us ? lat : sweet_fb_lat_max_us;
++			sweet_fb_timed++;
++		}
++		if (sweet_fb_prev_swap_at != 0) {
++			absolutetime_to_nanoseconds(t - sweet_fb_prev_swap_at, &gap);
++			gap /= 1000;
++			static const uint64_t ib[5] = { 12000, 18000, 25000, 35000, 50000 };
++			unsigned i = 0;
++			while (i < 5 && gap >= ib[i]) {
++				i++;
++			}
++			sweet_fb_int[i]++;
++			static const uint64_t gb[5] = { 1000, 2000, 4000, 8000, 16000 };
++			unsigned k = 0;
++			while (k < 5 && g >= gb[k]) {
++				k++;
++			}
++			sweet_fb_gpu[k]++;
++		}
++		sweet_fb_prev_swap_at = t;
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fSwaps++;

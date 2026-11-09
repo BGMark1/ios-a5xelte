@@ -1,0 +1,195 @@
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index bd8b403..c3dd95e 100644
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -33,6 +33,7 @@ bool herolte_pmic66_write(uint8_t reg, uint8_t value);
+ static LCK_GRP_DECLARE(fg_grp, "herolte_fg");
+ static LCK_MTX_DECLARE(fg_mtx, &fg_grp);
+ static uint32_t fg_target = 0x36u;
++volatile unsigned herolte_fg_cycles;
+ 
+ #define FG_HSI2C_PA     0x13650000u
+ #define FG_PINS_PA      0x136d0000u     /* GPI0 +0x00, GPD0 +0x20, GPD1 +0x40 */
+@@ -224,6 +225,32 @@ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, uns
+ 	    fg_word(FG_FULLCAP, &full);
+ 	uint16_t temp = 0;
+ 	bool temp_ok = ok && fg_word(0x08, &temp);
++	/*
++	 * (0345) MAX17047-family registers: VFSOC 0xff (voltage model), MIXSOC 0x0d, AVSOC 0x0e, REPSOC 0x06 (reported),
++	 * VFOCV 0xfb (open-circuit estimate, VCELL scale), FULLCAPNOM 0x23, CYCLES 0x17 (1% of a cycle), DESIGNCAP 0x18.
++	 */
++	static unsigned socs_logged;
++	uint16_t cyc = 0;
++	if (ok && fg_word(0x17, &cyc)) {
++		herolte_fg_cycles = cyc / 100u;
++	}
++	if (ok && socs_logged++ % 30 == 0) {
++		uint16_t vf = 0, mix = 0, av = 0, ocv = 0, nom = 0, dcap = 0, mixcap = 0, avcap = 0;
++		fg_word(0xff, &vf);
++		fg_word(0x0d, &mix);
++		fg_word(0x0e, &av);
++		fg_word(0xfb, &ocv);
++		fg_word(0x23, &nom);
++		fg_word(0x18, &dcap);
++		fg_word(0x0f, &mixcap);
++		fg_word(0x1f, &avcap);
++		printf("HEROLTE FG: rep %u.%02u%% vf %u.%02u%% mix %u.%02u%% av %u.%02u%%, ocv %u mV vcell %u mV, "
++		    "cap rep %u mix %u av %u full %u nom %u design %u mAh, cycles %u.%02u\n",
++		    soc >> 8, (soc & 0xff) * 100 / 256, vf >> 8, (vf & 0xff) * 100 / 256, mix >> 8, (mix & 0xff) * 100 / 256,
++		    av >> 8, (av & 0xff) * 100 / 256, (unsigned)((uint64_t)ocv * 78125u / 1000000u),
++		    (unsigned)((uint64_t)vcell * 78125u / 1000000u), rem / 2u, mixcap / 2u, avcap / 2u, full / 2u, nom / 2u,
++		    dcap / 2u, cyc / 100u, cyc % 100u);
++	}
+ 	lck_mtx_unlock(&fg_mtx);
+ 	if (!ok) {
+ 		return -1;
+@@ -292,6 +319,23 @@ herolte_pmic66_write(uint8_t reg, uint8_t value)
+ 
+ /* (0344) Samsung's max77854-private.h: PMIC/haptic 0xCC (0x66 here), charger 0xD2, gauge 0x6C, MUIC 0x4A. */
+ #define HM_CHG  0x69u
++#define HM_MUIC 0x25u
++
++static unsigned
++hm_chgin_ma(uint8_t v)
++{
++	v &= 0x7fu;
++	return v <= 3 ? 100u : v >= 0x78 ? 4000u : (v / 3u) * 100u + (v % 3u == 1 ? 33u : v % 3u == 2 ? 67u : 0u);
++}
++
++/*
++ * (0345) MUIC STATUS2 0x05: CHGTYP [2:0] (0 none, 1 USB, 2 CDP, 3 dedicated charger, 4 500 mA, 5 1 A, 6 3.3 V special),
++ * VBVOLT bit 6. Boot-arg herochgin=N (mA, default 1500, 0: leave the limit): with a dedicated charger or a CDP the
++ * CHGIN limit (CNFG_09, after the CNFG_06 CHGPROT unlock as Samsung's init) goes up to N; a 1 A charger to 1000. A PC
++ * port (USB, 500 mA) is left as the bootloader set it.
++ */
++static uint32_t hm_chgin_target = 1500;
++static bool hm_chgin_parsed, hm_raised;
+ 
+ /*
+  * Cable and charge state from the charger itself, not the gauge's current: CHGIN_OK (0xb2 bit 6) with CHGIN_DTLS
+@@ -310,20 +354,51 @@ herolte_chg_state(bool *external, bool *charging, bool *full)
+ 	static unsigned logged;
+ 	if ((ok != last_ok || (d1 & 0x0f) != last_d1) && logged < 40) {
+ 		logged++;
+-		uint8_t c0 = 0, c2 = 0, c9 = 0, c10 = 0, d2 = 0, id = 0;
++		uint8_t c0 = 0, c2 = 0, c9 = 0, c10 = 0, d2 = 0, id = 0, m1 = 0, m2 = 0, m3 = 0, c6 = 0;
++		hm_read(HM_MUIC, 0x04, &m1);
++		hm_read(HM_MUIC, 0x05, &m2);
++		hm_read(HM_MUIC, 0x06, &m3);
++		hm_read(HM_CHG, 0xbd, &c6);
+ 		hm_read(HM_CHG, 0xb5, &d2);
+ 		hm_read(HM_CHG, 0xb7, &c0);
+ 		hm_read(HM_CHG, 0xb9, &c2);
+ 		hm_read(HM_CHG, 0xc0, &c9);
+ 		hm_read(HM_CHG, 0xc1, &c10);
+ 		herolte_pmic66_read(0x00, &id);
+-		printf("HEROLTE CHG: pmic id %#x, int_ok %#x dtls %#x/%#x/%#x cnfg_00 %#x, charge %u mA (cnfg_02 %#x), input %u mA (cnfg_09 %#x, cnfg_10 %#x)\n",
+-		    id, ok, d0, d1, d2, c0, (c2 & 0x3fu) * 50u, c2, (c9 & 0x3fu) * 30u, c9, c10);
++		printf("HEROLTE CHG: muic %#x/%#x/%#x (type %u), cnfg_06 %#x, pmic id %#x, int_ok %#x dtls %#x/%#x/%#x cnfg_00 %#x, charge %u mA (cnfg_02 %#x), input %u mA (cnfg_09 %#x, cnfg_10 %#x)\n",
++		    m1, m2, m3, m2 & 7u, c6, id, ok, d0, d1, d2, c0, (c2 & 0x3fu) * 50u, c2, hm_chgin_ma(c9), c9, c10);
+ 		last_ok = ok;
+ 		last_d1 = d1 & 0x0f;
+ 	}
+ 	unsigned dtls = d1 & 0x0fu;
+ 	*external = (ok & 0x40u) != 0 && ((d0 >> 5) & 3u) == 3u;
++	if (!hm_chgin_parsed) {
++		hm_chgin_parsed = true;
++		PE_parse_boot_argn("herochgin", &hm_chgin_target, sizeof(hm_chgin_target));
++		if (hm_chgin_target > 2000) {
++			hm_chgin_target = 2000;
++		}
++	}
++	if (!*external) {
++		hm_raised = false;
++	} else if (!hm_raised && hm_chgin_target) {
++		uint8_t m2 = 0, c6 = 0, c9 = 0;
++		if (hm_read(HM_MUIC, 0x05, &m2) && hm_read(HM_CHG, 0xc0, &c9)) {
++			unsigned type = m2 & 7u, want = type == 2 || type == 3 ? hm_chgin_target : type == 5 ? 1000u : 0u;
++			if (want > 1000u && want > hm_chgin_ma(c9) && hm_read(HM_CHG, 0xbd, &c6)) {
++				uint8_t code = (uint8_t)((want / 100u) * 3u + (want % 100u >= 67u ? 2u : want % 100u >= 33u ? 1u : 0u));
++				bool w = ((c6 & 0x0cu) == 0x0cu || hm_write(HM_CHG, 0xbd, (uint8_t)(c6 | 0x0cu))) &&
++				    hm_write(HM_CHG, 0xc0, (uint8_t)((c9 & 0x80u) | code));
++				uint8_t back = 0;
++				hm_read(HM_CHG, 0xc0, &back);
++				printf("HEROLTE CHG: type %u, input limit %u -> %u mA (cnfg_09 %#x): %s\n", type, hm_chgin_ma(c9),
++				    hm_chgin_ma(back), back, w ? "ok" : "failed");
++			} else if (want == 1000u && hm_chgin_ma(c9) < 1000u) {
++				printf("HEROLTE CHG: type %u (1 A charger), input left at %u mA\n", type, hm_chgin_ma(c9));
++			}
++			hm_raised = true;
++		}
++	}
+ 	*charging = *external && dtls <= 2;
+ 	*full = *external && (dtls == 3 || dtls == 4);
+ 	return 0;
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 76d7983..02c037d 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -17,6 +17,8 @@
+ extern "C" int herolte_fg_init(void);
+ extern "C" int herolte_chg_state(bool *external, bool *charging, bool *full);
+ extern "C" void herolte_vib_init(void);
++extern "C" volatile int herolte_fg_temp_dc;         /* 0.1 C, bsd/dev/herolte_battery.c */
++extern "C" volatile unsigned herolte_fg_cycles;
+ extern "C" void herolte_vib_pattern(uint32_t on_ms, uint32_t off_ms, bool repeat, uint32_t intensity_q16);
+ 
+ /*
+@@ -177,7 +179,11 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+ 	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	setCycleCount(measured ? herolte_fg_cycles : 0);
++#else
+ 	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++#endif
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+@@ -185,11 +191,21 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putNumber("DesignCapacity", BATTERY_DESIGN_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* (0345) the gauge's TEMP (0.1 C) as centidegrees; 25 C without a measurement */
++	const int tdc = herolte_fg_temp_dc;
++	const bool tvalid = measured && tdc > -200 && tdc < 800;
++	putNumber("Temperature", tvalid ? (UInt32)(tdc * 10) : 2500);
++	putBool("SweetBatteryTemperatureEstimated", !tvalid);
++#else
+ 	putNumber("Temperature", 2500);
++#endif
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
++#if !defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	putBool("SweetBatteryTemperatureEstimated", true);
++#endif
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -291,6 +307,23 @@ SweetBattery::poll(void)
+ 		charging = c;
+ 		isFull = f;
+ 	}
++	static uint32_t delay_s = 0xffffffffu;
++	static uint64_t first_poll;
++	if (delay_s == 0xffffffffu) {
++		delay_s = 0;
++		PE_parse_boot_argn("herochgdelay", &delay_s, sizeof(delay_s));
++		first_poll = mach_absolute_time();
++	}
++	if (delay_s && external) {
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - first_poll, &ns);
++		if (ns < (uint64_t)delay_s * NSEC_PER_SEC) {
++			external = charging = isFull = false;
++		} else {
++			IOLog("SWEET BATTERY: cable reported after %u s (herochgdelay)\n", delay_s);
++			delay_s = 0;
++		}
++	}
+ 	static unsigned logged;
+ 	if (logged++ % 10 == 0) {
+ 		IOLog("SWEET BATTERY: %u%% %umV %dmA rem=%umAh full=%umAh external=%d charging=%d done=%d\n",

@@ -1,0 +1,2555 @@
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index a0c613a..c3dd95e 100644
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -14,10 +14,26 @@
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/thread_call.h>
++#include <mach/mach_time.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int herolte_fg_init(void);
+ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah);
++int herolte_chg_state(bool *external, bool *charging, bool *full);
++bool herolte_pmic66_read(uint8_t reg, uint8_t *value);
++bool herolte_pmic66_write(uint8_t reg, uint8_t value);
++
++/*
++ * (0342) The MAX77854's MFD/charger page at 0x66 shares this bus with the gauge (Samsung: slave 0xcc, CHG_INT_OK
++ * 0xb2, CHG_DTLS_00/01 0xb3/0xb4, CNFG 0xb7-0xc6). One lock for every transfer on the bus.
++ */
++static LCK_GRP_DECLARE(fg_grp, "herolte_fg");
++static LCK_MTX_DECLARE(fg_mtx, &fg_grp);
++static uint32_t fg_target = 0x36u;
++volatile unsigned herolte_fg_cycles;
+ 
+ #define FG_HSI2C_PA     0x13650000u
+ #define FG_PINS_PA      0x136d0000u     /* GPI0 +0x00, GPD0 +0x20, GPD1 +0x40 */
+@@ -97,7 +113,7 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+ 
+ 	fg_wr(fg_i2c, HSI2C_INT_STAT, fg_rd(fg_i2c, HSI2C_INT_STAT));
+ 	fg_wr(fg_i2c, HSI2C_FIFO_CTL, 3u | (receive ? (1u << 4) : (1u << 16)));
+-	fg_wr(fg_i2c, HSI2C_ADDR, FG_ADDR << 10);
++	fg_wr(fg_i2c, HSI2C_ADDR, fg_target << 10);
+ 	fg_wr(fg_i2c, HSI2C_CTL, 9u | (receive ? 0x40u : 0x80u));
+ 	fg_wr(fg_i2c, HSI2C_INT_EN, 0xf80u | (receive ? 0x42u : 1u));
+ 	/* Bit 16 read, bit 17 STOP_AFTER_TRANS, bit 31 MASTER_RUN. */
+@@ -199,11 +215,51 @@ int
+ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
+ {
+ 	uint16_t soc, vcell, current, rem, full;
+-	if (!fg_i2c || !fg_word(FG_REPSOC, &soc) || !fg_word(FG_VCELL, &vcell) ||
+-	    !fg_word(FG_CURRENT, &current) || !fg_word(FG_REPCAP, &rem) ||
+-	    !fg_word(FG_FULLCAP, &full)) {
++	if (!fg_i2c) {
++		return -1;
++	}
++	lck_mtx_lock(&fg_mtx);
++	fg_target = FG_ADDR;
++	bool ok = fg_word(FG_REPSOC, &soc) && fg_word(FG_VCELL, &vcell) &&
++	    fg_word(FG_CURRENT, &current) && fg_word(FG_REPCAP, &rem) &&
++	    fg_word(FG_FULLCAP, &full);
++	uint16_t temp = 0;
++	bool temp_ok = ok && fg_word(0x08, &temp);
++	/*
++	 * (0345) MAX17047-family registers: VFSOC 0xff (voltage model), MIXSOC 0x0d, AVSOC 0x0e, REPSOC 0x06 (reported),
++	 * VFOCV 0xfb (open-circuit estimate, VCELL scale), FULLCAPNOM 0x23, CYCLES 0x17 (1% of a cycle), DESIGNCAP 0x18.
++	 */
++	static unsigned socs_logged;
++	uint16_t cyc = 0;
++	if (ok && fg_word(0x17, &cyc)) {
++		herolte_fg_cycles = cyc / 100u;
++	}
++	if (ok && socs_logged++ % 30 == 0) {
++		uint16_t vf = 0, mix = 0, av = 0, ocv = 0, nom = 0, dcap = 0, mixcap = 0, avcap = 0;
++		fg_word(0xff, &vf);
++		fg_word(0x0d, &mix);
++		fg_word(0x0e, &av);
++		fg_word(0xfb, &ocv);
++		fg_word(0x23, &nom);
++		fg_word(0x18, &dcap);
++		fg_word(0x0f, &mixcap);
++		fg_word(0x1f, &avcap);
++		printf("HEROLTE FG: rep %u.%02u%% vf %u.%02u%% mix %u.%02u%% av %u.%02u%%, ocv %u mV vcell %u mV, "
++		    "cap rep %u mix %u av %u full %u nom %u design %u mAh, cycles %u.%02u\n",
++		    soc >> 8, (soc & 0xff) * 100 / 256, vf >> 8, (vf & 0xff) * 100 / 256, mix >> 8, (mix & 0xff) * 100 / 256,
++		    av >> 8, (av & 0xff) * 100 / 256, (unsigned)((uint64_t)ocv * 78125u / 1000000u),
++		    (unsigned)((uint64_t)vcell * 78125u / 1000000u), rem / 2u, mixcap / 2u, avcap / 2u, full / 2u, nom / 2u,
++		    dcap / 2u, cyc / 100u, cyc % 100u);
++	}
++	lck_mtx_unlock(&fg_mtx);
++	if (!ok) {
+ 		return -1;
+ 	}
++	/* (0330) TEMP 0x08: signed, 1/256 degree (the MAX17047 family's; Linux in TWRP read 30.6 C from it) */
++	extern volatile int herolte_fg_temp_dc;         /* bsd/dev/herolte_gpu.c, for the heat limit */
++	if (temp_ok) {
++		herolte_fg_temp_dc = (int)(int16_t)temp * 10 / 256;
++	}
+ 	unsigned permille = ((unsigned)soc * 10u) >> 8;
+ 	unsigned p = (permille * 1000u / FG_CAPACITY_MAX + 5u) / 10u;
+ 	*percent = p > 100 ? 100 : p;
+@@ -213,4 +269,366 @@ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, uns
+ 	*full_mah = full / 2u;
+ 	return 0;
+ }
++
++static bool
++hm_read(uint32_t page, uint8_t reg, uint8_t *value)
++{
++	if (!fg_i2c) {
++		return false;
++	}
++	lck_mtx_lock(&fg_mtx);
++	fg_target = page;
++	bool ok = false;
++	for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
++		ok = fg_message(false, &reg, 1, false) && fg_message(true, value, 1, true);
++	}
++	fg_target = FG_ADDR;
++	lck_mtx_unlock(&fg_mtx);
++	return ok;
++}
++
++static bool
++hm_write(uint32_t page, uint8_t reg, uint8_t value)
++{
++	if (!fg_i2c) {
++		return false;
++	}
++	uint8_t b[2] = { reg, value };
++	lck_mtx_lock(&fg_mtx);
++	fg_target = page;
++	bool ok = false;
++	for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
++		ok = fg_message(false, b, 2, true);
++	}
++	fg_target = FG_ADDR;
++	lck_mtx_unlock(&fg_mtx);
++	return ok;
++}
++
++bool
++herolte_pmic66_read(uint8_t reg, uint8_t *value)
++{
++	return hm_read(0x66u, reg, value);
++}
++
++bool
++herolte_pmic66_write(uint8_t reg, uint8_t value)
++{
++	return hm_write(0x66u, reg, value);
++}
++
++/* (0344) Samsung's max77854-private.h: PMIC/haptic 0xCC (0x66 here), charger 0xD2, gauge 0x6C, MUIC 0x4A. */
++#define HM_CHG  0x69u
++#define HM_MUIC 0x25u
++
++static unsigned
++hm_chgin_ma(uint8_t v)
++{
++	v &= 0x7fu;
++	return v <= 3 ? 100u : v >= 0x78 ? 4000u : (v / 3u) * 100u + (v % 3u == 1 ? 33u : v % 3u == 2 ? 67u : 0u);
++}
++
++/*
++ * (0345) MUIC STATUS2 0x05: CHGTYP [2:0] (0 none, 1 USB, 2 CDP, 3 dedicated charger, 4 500 mA, 5 1 A, 6 3.3 V special),
++ * VBVOLT bit 6. Boot-arg herochgin=N (mA, default 1500, 0: leave the limit): with a dedicated charger or a CDP the
++ * CHGIN limit (CNFG_09, after the CNFG_06 CHGPROT unlock as Samsung's init) goes up to N; a 1 A charger to 1000. A PC
++ * port (USB, 500 mA) is left as the bootloader set it.
++ */
++static uint32_t hm_chgin_target = 1500;
++static bool hm_chgin_parsed, hm_raised;
++
++/*
++ * Cable and charge state from the charger itself, not the gauge's current: CHGIN_OK (0xb2 bit 6) with CHGIN_DTLS
++ * (0xb3 [6:5]) 3 = valid VBUS; CHG_DTLS (0xb4 [3:0]) 0-2 charging, 3-4 top-off/done (Samsung counts both as full).
++ * The bootloader's configuration (CNFG_00 mode, CNFG_02 charge current in 50 mA, CNFG_09 input limit in 30 mA)
++ * is logged once and left as it is.
++ */
++int
++herolte_chg_state(bool *external, bool *charging, bool *full)
++{
++	uint8_t ok = 0, d0 = 0, d1 = 0;
++	if (!hm_read(HM_CHG, 0xb2, &ok) || !hm_read(HM_CHG, 0xb3, &d0) || !hm_read(HM_CHG, 0xb4, &d1)) {
++		return -1;
++	}
++	static uint8_t last_ok = 0xff, last_d1 = 0xff;
++	static unsigned logged;
++	if ((ok != last_ok || (d1 & 0x0f) != last_d1) && logged < 40) {
++		logged++;
++		uint8_t c0 = 0, c2 = 0, c9 = 0, c10 = 0, d2 = 0, id = 0, m1 = 0, m2 = 0, m3 = 0, c6 = 0;
++		hm_read(HM_MUIC, 0x04, &m1);
++		hm_read(HM_MUIC, 0x05, &m2);
++		hm_read(HM_MUIC, 0x06, &m3);
++		hm_read(HM_CHG, 0xbd, &c6);
++		hm_read(HM_CHG, 0xb5, &d2);
++		hm_read(HM_CHG, 0xb7, &c0);
++		hm_read(HM_CHG, 0xb9, &c2);
++		hm_read(HM_CHG, 0xc0, &c9);
++		hm_read(HM_CHG, 0xc1, &c10);
++		herolte_pmic66_read(0x00, &id);
++		printf("HEROLTE CHG: muic %#x/%#x/%#x (type %u), cnfg_06 %#x, pmic id %#x, int_ok %#x dtls %#x/%#x/%#x cnfg_00 %#x, charge %u mA (cnfg_02 %#x), input %u mA (cnfg_09 %#x, cnfg_10 %#x)\n",
++		    m1, m2, m3, m2 & 7u, c6, id, ok, d0, d1, d2, c0, (c2 & 0x3fu) * 50u, c2, hm_chgin_ma(c9), c9, c10);
++		last_ok = ok;
++		last_d1 = d1 & 0x0f;
++	}
++	unsigned dtls = d1 & 0x0fu;
++	*external = (ok & 0x40u) != 0 && ((d0 >> 5) & 3u) == 3u;
++	if (!hm_chgin_parsed) {
++		hm_chgin_parsed = true;
++		PE_parse_boot_argn("herochgin", &hm_chgin_target, sizeof(hm_chgin_target));
++		if (hm_chgin_target > 2000) {
++			hm_chgin_target = 2000;
++		}
++	}
++	if (!*external) {
++		hm_raised = false;
++	} else if (!hm_raised && hm_chgin_target) {
++		uint8_t m2 = 0, c6 = 0, c9 = 0;
++		if (hm_read(HM_MUIC, 0x05, &m2) && hm_read(HM_CHG, 0xc0, &c9)) {
++			unsigned type = m2 & 7u, want = type == 2 || type == 3 ? hm_chgin_target : type == 5 ? 1000u : 0u;
++			if (want > 1000u && want > hm_chgin_ma(c9) && hm_read(HM_CHG, 0xbd, &c6)) {
++				uint8_t code = (uint8_t)((want / 100u) * 3u + (want % 100u >= 67u ? 2u : want % 100u >= 33u ? 1u : 0u));
++				bool w = ((c6 & 0x0cu) == 0x0cu || hm_write(HM_CHG, 0xbd, (uint8_t)(c6 | 0x0cu))) &&
++				    hm_write(HM_CHG, 0xc0, (uint8_t)((c9 & 0x80u) | code));
++				uint8_t back = 0;
++				hm_read(HM_CHG, 0xc0, &back);
++				printf("HEROLTE CHG: type %u, input limit %u -> %u mA (cnfg_09 %#x): %s\n", type, hm_chgin_ma(c9),
++				    hm_chgin_ma(back), back, w ? "ok" : "failed");
++			} else if (want == 1000u && hm_chgin_ma(c9) < 1000u) {
++				printf("HEROLTE CHG: type %u (1 A charger), input left at %u mA\n", type, hm_chgin_ma(c9));
++			}
++			hm_raised = true;
++		}
++	}
++	*charging = *external && dtls <= 2;
++	*full = *external && (dtls == 3 || dtls == 4);
++	return 0;
++}
++
++/*
++ * (0343) The vibration motor, as Samsung's max77854_haptic.c with this phone's DTB (exynos8890-herolte_motor.dtsi):
++ * an LRA on the MAX77854's haptic driver, MCONFIG 0x10 = 0x82 (LRA, divider 128) and MOTOR_EN (bit 6) to run,
++ * BIASEN (MAINCTRL1 0x02 bit 7) once; its supply VDD_MOT_3.3V is the S2MPS16's LDO34 (L34CTRL 0x5e, enable [7:6]);
++ * the drive is PWM timer 1 of 0x136c0000 on GPD0-5 (function 2, pull-down), period 37950 ns, duty 32500 ns (the
++ * strongest; half the period is no force). herolte_vibrate(ms) runs it for ms (0: stop).
++ */
++#define HV_PWM_PA       0x136c0000u
++#define HV_GPD0         0x20
++#define HV_PERIOD_NS    37950u
++#define HV_DUTY_NS      32500u
++extern bool herolte_apm_pmic_read(uint8_t reg, uint8_t *value);
++extern bool herolte_apm_pmic_write(uint8_t reg, uint8_t value);
++void herolte_vibrate(uint32_t ms);
++static vm_offset_t hv_pwm;
++static uint64_t hv_tin_hz;
++static int hv_state;            /* 0 not set up, 1 ready, -1 failed */
++static LCK_MTX_DECLARE(hv_mtx, &fg_grp);
++
++static void
++hv_pwm_set(uint32_t duty_ns)
++{
++	uint32_t tcnt = (uint32_t)(hv_tin_hz * HV_PERIOD_NS / 1000000000ull);
++	uint32_t high = (uint32_t)(hv_tin_hz * duty_ns / 1000000000ull);
++	if (tcnt < 4) {
++		return;
++	}
++	if (high >= tcnt) {
++		high = tcnt - 1;
++	}
++	/* pwm-samsung.c: TCNTB = tcnt - 1, TCMPB = tcnt - 1 - high (the output is high while TCNT > TCMP) */
++	fg_wr(hv_pwm, 0x18, tcnt - 1);
++	fg_wr(hv_pwm, 0x1c, tcnt - 1 - high);
++}
++
++static bool
++hv_setup(void)
++{
++	uint8_t l34 = 0, v = 0;
++	if (!herolte_apm_pmic_read(0x5e, &l34)) {
++		return false;       /* the APM is not up yet */
++	}
++	hv_pwm = ml_io_map(HV_PWM_PA, 0x1000);
++	if (!hv_pwm || !fg_pins) {
++		hv_state = -1;
++		return false;
++	}
++	printf("HEROLTE VIB: LDO34 %#x, GPD0 con %#x pud %#x, PWM tcfg0 %#x tcfg1 %#x tcon %#x tcntb1 %#x tcmpb1 %#x\n", l34,
++	    fg_rd(fg_pins, HV_GPD0), fg_rd(fg_pins, HV_GPD0 + 8), fg_rd(hv_pwm, 0x00), fg_rd(hv_pwm, 0x04), fg_rd(hv_pwm, 0x08),
++	    fg_rd(hv_pwm, 0x18), fg_rd(hv_pwm, 0x1c));
++	/* GPD0-5: TOUT1 (function 2), pull-down */
++	fg_wr(fg_pins, HV_GPD0, (fg_rd(fg_pins, HV_GPD0) & ~(0xfu << 20)) | (2u << 20));
++	fg_wr(fg_pins, HV_GPD0 + 8, (fg_rd(fg_pins, HV_GPD0 + 8) & ~(3u << 10)) | (1u << 10));
++	/* timer 1: prescaler 0 (+1), divider 1/1; its input clock measured with a free count */
++	uint32_t tcon = fg_rd(hv_pwm, 0x08) & ~(0xbu << 8);
++	fg_wr(hv_pwm, 0x04, fg_rd(hv_pwm, 0x04) & ~(0xfu << 4));
++	uint32_t pre = fg_rd(hv_pwm, 0x00) & 0xffu;
++	fg_wr(hv_pwm, 0x00, fg_rd(hv_pwm, 0x00) & ~0xffu);
++	fg_wr(hv_pwm, 0x18, 0xffffffffu);
++	fg_wr(hv_pwm, 0x1c, 0);
++	fg_wr(hv_pwm, 0x08, tcon | (1u << 9));
++	fg_wr(hv_pwm, 0x08, tcon | (1u << 8));
++	uint64_t t0 = mach_absolute_time();
++	uint32_t c0 = fg_rd(hv_pwm, 0x20);
++	delay(2000);
++	uint32_t c1 = fg_rd(hv_pwm, 0x20);
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	fg_wr(hv_pwm, 0x08, tcon);
++	hv_tin_hz = ns ? (uint64_t)(c0 - c1) * 1000000000ull / ns : 0;
++	printf("HEROLTE VIB: timer 1 counts %u in %llu ns (prescaler was %u, now 0): %llu Hz\n", c0 - c1, ns, pre, hv_tin_hz);
++	if (hv_tin_hz < 1000000) {
++		printf("HEROLTE VIB: the PWM timer does not run, no vibration\n");
++		hv_state = -1;
++		return false;
++	}
++	/* idle drive: half the period (no force), auto-reload */
++	hv_pwm_set(HV_PERIOD_NS / 2);
++	fg_wr(hv_pwm, 0x08, tcon | (1u << 9) | (1u << 11));
++	fg_wr(hv_pwm, 0x08, tcon | (1u << 11));
++	/* the supply, then the haptic block (Samsung: 6 ms after the supply) */
++	if (!(l34 & 0xc0u) && !herolte_apm_pmic_write(0x5e, (uint8_t)(l34 | 0xc0u))) {
++		printf("HEROLTE VIB: LDO34 enable failed\n");
++		hv_state = -1;
++		return false;
++	}
++	delay(6000);
++	uint8_t main1 = 0, mcfg = 0;
++	bool ok = herolte_pmic66_read(0x02, &main1) && herolte_pmic66_write(0x02, (uint8_t)(main1 | 0x80u)) &&
++	    herolte_pmic66_read(0x10, &mcfg) && herolte_pmic66_write(0x10, 0x82u);
++	herolte_apm_pmic_read(0x5e, &v);
++	printf("HEROLTE VIB: LDO34 now %#x, MAINCTRL1 %#x -> %#x, MCONFIG %#x -> 0x82: %s\n", v, main1, main1 | 0x80u, mcfg,
++	    ok ? "ready" : "failed");
++	hv_state = ok ? 1 : -1;
++	return ok;
++}
++
++static uint32_t hv_on_ms, hv_off_ms, hv_duty = HV_DUTY_NS, hv_gen;
++static bool hv_repeat;
++static uint64_t hv_until;       /* a repeating pattern stops by itself after 2 minutes */
++static thread_call_t hv_call;
++void herolte_vib_pattern(uint32_t on_ms, uint32_t off_ms, bool repeat, uint32_t intensity_q16);
++
++static void
++hv_motor_locked(bool on)
++{
++	uint32_t tcon = fg_rd(hv_pwm, 0x08) & ~(0xbu << 8);
++	if (on) {
++		hv_pwm_set(hv_duty);
++		fg_wr(hv_pwm, 0x08, tcon | (1u << 9) | (1u << 11));
++		fg_wr(hv_pwm, 0x08, tcon | (1u << 8) | (1u << 11));
++		herolte_pmic66_write(0x10, 0x82u | 0x40u);
++	} else {
++		herolte_pmic66_write(0x10, 0x82u);
++		hv_pwm_set(HV_PERIOD_NS / 2);
++		fg_wr(hv_pwm, 0x08, tcon);
++	}
++}
++
++static void
++hv_schedule_locked(uint32_t ms, bool turn_on)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	thread_call_enter1_delayed(hv_call, (thread_call_param_t)(uintptr_t)((hv_gen << 1) | (turn_on ? 1u : 0u)), deadline);
++}
++
++static void
++hv_tick(__unused thread_call_param_t p0, thread_call_param_t p1)
++{
++	uint32_t v = (uint32_t)(uintptr_t)p1;
++	lck_mtx_lock(&hv_mtx);
++	if (hv_state != 1 || (v >> 1) != hv_gen) {
++		lck_mtx_unlock(&hv_mtx);
++		return;
++	}
++	bool more = hv_repeat && mach_absolute_time() < hv_until;
++	if (v & 1u) {
++		if (more) {
++			hv_motor_locked(true);
++			hv_schedule_locked(hv_on_ms, false);
++		}
++	} else if (more && hv_off_ms == 0) {
++		hv_schedule_locked(hv_on_ms, false);    /* continuous */
++	} else {
++		hv_motor_locked(false);
++		if (more) {
++			hv_schedule_locked(hv_off_ms, true);
++		}
++	}
++	lck_mtx_unlock(&hv_mtx);
++}
++
++/* on_ms 0: stop. intensity_q16: 16.16 fixed (iOS's "intensity"), 0 or >= 1.0: full force. */
++void
++herolte_vib_pattern(uint32_t on_ms, uint32_t off_ms, bool repeat, uint32_t intensity_q16)
++{
++	lck_mtx_lock(&hv_mtx);
++	if (hv_state == 0) {
++		hv_setup();
++	}
++	if (hv_state != 1) {
++		lck_mtx_unlock(&hv_mtx);
++		return;
++	}
++	if (!hv_call) {
++		hv_call = thread_call_allocate_with_options(hv_tick, NULL, THREAD_CALL_PRIORITY_HIGH, 0);
++	}
++	hv_gen++;
++	if (hv_call) {
++		thread_call_cancel(hv_call);
++	}
++	if (on_ms == 0 || !hv_call) {
++		hv_repeat = false;
++		hv_motor_locked(false);
++		lck_mtx_unlock(&hv_mtx);
++		return;
++	}
++	hv_on_ms = on_ms > 10000 ? 10000 : on_ms;       /* haptic,max_timeout */
++	hv_off_ms = off_ms > 10000 ? 10000 : off_ms;
++	hv_repeat = repeat;
++	uint32_t half = HV_PERIOD_NS / 2;
++	hv_duty = (intensity_q16 == 0 || intensity_q16 >= 0x10000u) ? HV_DUTY_NS :
++	    half + (uint32_t)((uint64_t)(HV_DUTY_NS - half) * intensity_q16 >> 16);
++	uint64_t span;
++	nanoseconds_to_absolutetime(120ull * NSEC_PER_SEC, &span);
++	hv_until = mach_absolute_time() + span;
++	hv_motor_locked(true);
++	hv_schedule_locked(hv_on_ms, false);
++	lck_mtx_unlock(&hv_mtx);
++}
++
++void
++herolte_vibrate(uint32_t ms)
++{
++	herolte_vib_pattern(ms, 0, false, 0);
++}
++
++/* Boot-arg herovib=N: once the APM answers, three pulses of N ms, a second apart (a hardware check). */
++static void
++hv_boot_test(void *arg, __unused wait_result_t w)
++{
++	uint32_t ms = (uint32_t)(uintptr_t)arg;
++	uint8_t id = 0;
++	for (unsigned i = 0; i < 120 && !herolte_apm_pmic_read(0x00, &id); i++) {
++		delay(500000);
++	}
++	delay(20000000);        /* past the boot logo, so it can be felt on its own */
++	for (unsigned i = 0; i < 3; i++) {
++		printf("HEROLTE VIB: test pulse %u, %u ms\n", i + 1, ms);
++		herolte_vibrate(ms);
++		delay(1000000);
++	}
++	printf("HEROLTE VIB: test done (state %d)\n", hv_state);
++}
++
++void herolte_vib_init(void);
++void
++herolte_vib_init(void)
++{
++	uint32_t ms = 0;
++	thread_t thread;
++	if (PE_parse_boot_argn("herovib", &ms, sizeof(ms)) && ms != 0 &&
++	    kernel_thread_start(hv_boot_test, (void *)(uintptr_t)ms, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_HEROLTE */
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+index 2b4efd9..4530fdc 100644
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -102,6 +102,14 @@ herolte_noexec(const char *path)
+ 	if (strcmp(base, "AegirPoster") == 0) {
+ 		return true;
+ 	}
++	/*
++	 * The speech synthesizers' audio units abort as PlugInKit starts them (an Objective-C exception out of its
++	 * plug-in set-up) and are started again all session: 54 crashes in boot-0323, each a process launch.
++	 */
++	if (strcmp(base, "SiriTTSSynthesizerAU") == 0 || strcmp(base, "KonaSynthesizer") == 0 ||
++	    strcmp(base, "MacinTalkAUSP") == 0) {
++		return true;
++	}
+ 	if (hgl_noexec[0] == '\0') {
+ 		return false;
+ 	}
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index f32878b..992fcaf 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -21,6 +21,7 @@
+ #include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <vm/pmap.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void herolte_gpu_probe(void);
+@@ -340,6 +341,13 @@ static uint32_t hg_affinity = 1;
+  * 2: and not after vertex jobs either, whose results the fragment job reads through the same cache.
+  */
+ static uint32_t hg_flush_mode = 1;
++/*
++ * (0341) Boot-arg herogpu_sleep=N: a client's job is polled for herogpu_spin us (50 by default), then the thread
++ * sleeps N us at a time between polls instead of spinning (delay(10) spins here, a core busy for every job of the
++ * ~15 a frame). 0 (default): polled as before.
++ */
++static uint32_t hg_sleep_us, hg_spin_us = 50;
++static uint64_t hg_sleeps, hg_sleep_jobs;
+ /* GPU VA of the job chain hg_run() starts, and of its header (for the log). */
+ static uint64_t hg_job_va = HG_TEST_VA;
+ static vm_offset_t hg_job_cpu;
+@@ -762,6 +770,33 @@ hg_run(unsigned js, const char *what)
+ 	hg_wr(hg_gpu, slot + 0x60, 1);                          /* START */
+ 
+ 	uint32_t jirq = 0, mirq = 0, girq = 0;
++	if (hg_run_quiet && hg_sleep_us != 0) {
++		uint64_t t0 = mach_absolute_time(), spin, step, limit;
++		nanoseconds_to_absolutetime((uint64_t)hg_spin_us * 1000, &spin);
++		nanoseconds_to_absolutetime((uint64_t)hg_sleep_us * 1000, &step);
++		nanoseconds_to_absolutetime(200000000ULL, &limit);
++		bool slept = false;
++		for (;;) {
++			jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
++			mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
++			girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
++			if ((jirq & ((1u << js) | (1u << (js + 16)))) || mirq || (girq & 0x81)) {
++				break;
++			}
++			uint64_t now = mach_absolute_time();
++			if (now - t0 > limit) {
++				break;
++			}
++			if (now - t0 < spin) {
++				continue;
++			}
++			assert_wait_deadline((event_t)&hg_sleeps, THREAD_UNINT, now + step);
++			thread_block(THREAD_CONTINUE_NULL);
++			hg_sleeps++;
++			slept = true;
++		}
++		hg_sleep_jobs += slept ? 1 : 0;
++	} else {
+ 	for (unsigned i = 0; i < 20000; i++) {
+ 		jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
+ 		mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
+@@ -771,6 +806,7 @@ hg_run(unsigned js, const char *what)
+ 		}
+ 		delay(10);
+ 	}
++	}
+ 	volatile uint32_t *hdr = (volatile uint32_t *)(hg_job_cpu ? hg_job_cpu : hg_mem + HG_DATA_OFF);
+ 	bool ok = (jirq & (1u << js)) && !(jirq & (1u << (js + 16))) && !mirq && !(girq & 0x81);
+ 	hg_last_js_status = hg_rd(hg_gpu, slot + 0x24);
+@@ -1675,6 +1711,7 @@ hgp_map_locked(uint32_t id, const uint64_t *pages, unsigned n)
+  * buffer for good.
+  */
+ #define HG_FB2_PA       0x91000000ull
++#define HG_FB2_RESERVED (16u * 1024u * 1024u)
+ #define HG_PANEL2_VA    0x06000000ull
+ #define HGP_FB2_TABLES  8u
+ #define HGP_FB2_L3_OFF  (HGP_L3_OFF + HGP_SLOTS * HGP_SLOT_TABLES * 0x1000u)
+@@ -1682,6 +1719,8 @@ _Static_assert(HGP_FB2_L3_OFF + HGP_FB2_TABLES * 0x1000u <= HG_SCR_BYTES,
+     "second panel tables exceed GPU scratch memory");
+ _Static_assert(HG_PANEL_BYTES <= HGP_FB2_TABLES * 0x200000u,
+     "second panel exceeds GPU mapping");
++_Static_assert(HG_PANEL_BYTES <= HG_FB2_RESERVED,
++    "second panel exceeds its physical reservation");
+ #define HG_IDMA_G1_PA   0x13952000u
+ #define HG_DECON_F_PA   0x13960000u
+ static vm_offset_t hfb_idma;
+@@ -1730,10 +1769,15 @@ hfb_setup_locked(void)
+ 	if (on != 1) {
+ 		return;
+ 	}
+-	/* This test reserves the first-bank buffer only with the single bank2 layout. */
++	/* Keep the established bootstrap layout and check the extra managed banks separately. */
+ 	const boot_args *args = PE_state.bootArgs;
+ 	if (!args || args->physBase != 0x880000000ull || args->memSizeActual != 0x80000000ull) {
+-		printf("HEROLTE FB2: requires the 2 GiB bank2 layout; one buffer\n");
++		printf("HEROLTE FB2: requires the 2 GiB bank2 boot window; one buffer\n");
++		return;
++	}
++	if (pmap_has_managed_page((ppnum_t)(HG_FB2_PA >> PAGE_SHIFT),
++	    (ppnum_t)((HG_FB2_PA + HG_FB2_RESERVED - 1) >> PAGE_SHIFT))) {
++		printf("HEROLTE FB2: second buffer overlaps managed RAM; one buffer\n");
+ 		return;
+ 	}
+ 	vm_offset_t decon = ml_io_map(HG_DECON_F_PA, 0x1000);
+@@ -2032,6 +2076,9 @@ herolte_gpu_unmap(uint64_t va, unsigned n)
+  * tiler, compute) on all shader cores and wait (bounded). Returns 0 when
+  * it finished cleanly, else JS_STATUS (or ~0 if it never ran); *us = time.
+  */
++/* (0340) all clients' job time, for the framebuffer's per-frame statistics */
++volatile uint64_t herolte_gpu_busy_us;
++
+ uint32_t
+ herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us)
+ {
+@@ -2051,8 +2098,10 @@ herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us)
+ 		hg_job_va = HG_TEST_VA;
+ 		hg_affinity = 1;
+ 		status = ok ? 0 : (hg_last_js_status ? hg_last_js_status : ~0u);
++		uint64_t took = hg_us_since(start);
++		herolte_gpu_busy_us += took;
+ 		if (us) {
+-			*us = hg_us_since(start);
++			*us = took;
+ 		}
+ 	}
+ 	lck_mtx_unlock(hg_mtx);
+@@ -2183,18 +2232,135 @@ hc_mux(vm_offset_t base, uint32_t off, uint32_t src)
+ 	delay(50);
+ }
+ 
++static const struct {
++	uint16_t off;
++	uint8_t ratio;
++	uint8_t bits;
++} hc_divs[] = {
++	{ 0x400, 0, 6 }, { 0x404, 2, 4 }, { 0x424, 7, 6 }, { 0x408, 4, 4 }, { 0x41c, 7, 6 }, { 0x428, 7, 4 },
++	{ 0x434, 1, 3 }, { 0x430, 5, 3 }, { 0x40c, 3, 6 }, { 0x410, 3, 4 }, { 0x414, 7, 4 }, { 0x418, 7, 4 },
++};
++#define HC_NDIVS        (sizeof(hc_divs) / sizeof(hc_divs[0]))
++#define HC_PLL_BITS     ((0x3ffu << 16) | (0x3fu << 8) | 7u | (1u << 26) | (1u << 5))
++
++/*
++ * (0330) The cluster as the bootloader left it (728 MHz, 675 mV on this phone: boot-0329), saved before the first raise,
++ * and the raised rate: with the screen off or the battery hot the cores go back to exactly the bootloader's numbers
++ * (hc_go_low), and up again to herocpu_mhz (hc_go_high). Only the power thread (hg_power_thread) moves them after boot.
++ */
++static struct {
++	bool saved, high, broken;
++	uint32_t boot_pll, boot_div[HC_NDIVS], boot_ema, boot_assist;
++	uint8_t boot_volt;
++	uint32_t mhz, m;
++	uint8_t volt, promise;
++	vm_offset_t top, mngs, sysreg;
++} hc;
++
++/* Over to BUS_PLL / 2 (528 MHz) through the switch mux, the cores' own PLL stopped from feeding them. */
+ static void
+-hg_cpu_up(void)
++hc_to_switch(void)
++{
++	hg_wr(hc.top, 0x990, hg_rd(hc.top, 0x990) | 1);
++	hg_wr(hc.top, 0x4f0, (hg_rd(hc.top, 0x4f0) & ~0xfu) | 1);
++	hc_mux(hc.top, 0x380, 0);
++	hc_mux(hc.mngs, 0x204, 1);
++	hc_mux(hc.mngs, 0x208, 1);
++}
++
++static void
++hc_from_switch(void)
++{
++	hc_mux(hc.mngs, 0x208, 0);
++	hc_mux(hc.mngs, 0x204, 0);
++}
++
++/* MNGS_PLL relocked with these M/P/S (and bits 5, 26) while the cores run on the switch. */
++static bool
++hc_relock(uint32_t bits)
++{
++	uint32_t con0 = (hg_rd(hc.mngs, 0x100) & ~HC_PLL_BITS) | (bits & HC_PLL_BITS);
++	hg_wr(hc.mngs, 0x000, 3 * 150);         /* MNGS_PLL_LOCK */
++	hg_wr(hc.mngs, 0x100, con0);
++	for (unsigned i = 0; i < 10000; i++) {
++		delay(1);
++		if ((hg_rd(hc.mngs, 0x100) >> 29) & 1) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Voltage first (read back), then EMA, dividers, the switch, the PLL at the raised rate, back to it. */
++static bool
++hc_go_high(void)
+ {
+ 	extern bool herolte_apm_mngs_voltage(uint8_t value);
+-	static const struct {
+-		uint16_t off;
+-		uint8_t ratio;
+-		uint8_t bits;
+-	} divs[] = {
+-		{ 0x400, 0, 6 }, { 0x404, 2, 4 }, { 0x424, 7, 6 }, { 0x408, 4, 4 }, { 0x41c, 7, 6 }, { 0x428, 7, 4 },
+-		{ 0x434, 1, 3 }, { 0x430, 5, 3 }, { 0x40c, 3, 6 }, { 0x410, 3, 4 }, { 0x414, 7, 4 }, { 0x418, 7, 4 },
+-	};
++	uint8_t now = 0, set = 0;
++	if (!herolte_apm_pmic_read(0x1d, &now)) {
++		return false;
++	}
++	if (now < hc.volt) {
++		bool wrote = herolte_apm_mngs_voltage(hc.volt);
++		delay(200);
++		if (!wrote || !herolte_apm_pmic_read(0x1d, &set) || set != hc.volt) {
++			printf("HEROLTE CPU: vdd_mngs %#x -> %#x failed (now %#x), left alone\n", now, hc.volt, set);
++			return false;
++		}
++	}
++	hg_wr(hc.sysreg, 0x314, 0x001091b9);    /* MNGS_EMA_CON for 900 mV and more */
++	hg_wr(hc.sysreg, 0x1040, 0);            /* MNGS_ASSIST_CON */
++	for (unsigned i = 0; i < HC_NDIVS; i++) {
++		uint32_t mask = (1u << hc_divs[i].bits) - 1;
++		hg_wr(hc.mngs, hc_divs[i].off, (hg_rd(hc.mngs, hc_divs[i].off) & ~mask) |
++		    (hc_divs[i].off == 0x430 ? hc.promise : hc_divs[i].ratio));
++		delay(20);
++	}
++	hc_to_switch();
++	if (!hc_relock((hc.m << 16) | (3u << 8) | (1u << 5))) {
++		printf("HEROLTE CPU: MNGS_PLL did not lock (%#x): the cores stay on the switch\n", hg_rd(hc.mngs, 0x100));
++		hc.broken = true;
++		return false;
++	}
++	hc_from_switch();
++	hc.high = true;
++	return true;
++}
++
++/* Down to the bootloader's numbers: the switch, the PLL relocked as it was, its dividers, back to it, EMA, then the voltage. */
++static bool
++hc_go_low(void)
++{
++	extern bool herolte_apm_mngs_voltage(uint8_t value);
++	hc_to_switch();
++	if (!hc_relock(hc.boot_pll)) {
++		printf("HEROLTE CPU: MNGS_PLL did not lock at the boot rate (%#x)\n", hg_rd(hc.mngs, 0x100));
++		if (hc_relock((hc.m << 16) | (3u << 8) | (1u << 5))) {
++			hc_from_switch();
++		}
++		hc.broken = true;
++		return false;
++	}
++	for (unsigned i = 0; i < HC_NDIVS; i++) {
++		hg_wr(hc.mngs, hc_divs[i].off, hc.boot_div[i]);
++		delay(20);
++	}
++	hc_from_switch();
++	hc.high = false;
++	hg_wr(hc.sysreg, 0x314, hc.boot_ema);
++	hg_wr(hc.sysreg, 0x1040, hc.boot_assist);
++	uint8_t set = 0;
++	bool wrote = herolte_apm_mngs_voltage(hc.boot_volt);
++	delay(200);
++	if (!wrote || !herolte_apm_pmic_read(0x1d, &set) || set != hc.boot_volt) {
++		printf("HEROLTE CPU: vdd_mngs back to %#x failed (now %#x)\n", hc.boot_volt, set);
++	}
++	return true;
++}
++
++static void
++hg_cpu_up(void)
++{
+ 	/* ECT, this phone: rate, MNGS_PLL M (P 3, S 0), vdd_mngs register = (mV - 300) / 6.25, DIV_SCLK_PROMISE */
+ 	static const struct {
+ 		uint32_t mhz, m;
+@@ -2228,51 +2394,168 @@ hg_cpu_up(void)
+ 	uint32_t con0 = hg_rd(mngs, 0x100);
+ 	printf("HEROLTE CPU: MNGS_PLL con0 %#x: M %u P %u S %u, mux %#x stat %#x, top mux %#x div %#x gate %#x\n", con0, (con0 >> 16) & 0x3ff,
+ 	    (con0 >> 8) & 0x3f, con0 & 7, hg_rd(mngs, 0x208), hg_rd(mngs, 0x608), hg_rd(top, 0x380), hg_rd(top, 0x4f0), hg_rd(top, 0x990));
+-	for (unsigned i = 0; i < sizeof(divs) / sizeof(divs[0]); i++) {
+-		printf("HEROLTE CPU: div %#x = %#x\n", divs[i].off, hg_rd(mngs, divs[i].off));
++	for (unsigned i = 0; i < HC_NDIVS; i++) {
++		printf("HEROLTE CPU: div %#x = %#x\n", hc_divs[i].off, hg_rd(mngs, hc_divs[i].off));
+ 	}
+ 	if (!herolte_apm_pmic_read(0x1d, &now)) {
+ 		return;     /* the APM is not up yet: the next call */
+ 	}
+ 	done = true;
+-	if (now < volt) {
+-		bool wrote = herolte_apm_mngs_voltage(volt);
+-		delay(200);
+-		if (!wrote || !herolte_apm_pmic_read(0x1d, &set) || set != volt) {
+-			printf("HEROLTE CPU: vdd_mngs %#x -> %#x failed (now %#x), left alone\n", now, volt, set);
+-			return;
+-		}
++	/* the bootloader's numbers, for hc_go_low() */
++	hc.top = top;
++	hc.mngs = mngs;
++	hc.sysreg = sysreg;
++	hc.boot_pll = con0 & HC_PLL_BITS;
++	for (unsigned i = 0; i < HC_NDIVS; i++) {
++		hc.boot_div[i] = hg_rd(mngs, hc_divs[i].off);
++	}
++	hc.boot_ema = hg_rd(sysreg, 0x314);
++	hc.boot_assist = hg_rd(sysreg, 0x1040);
++	hc.boot_volt = now;
++	hc.mhz = mhz;
++	hc.m = target_m;
++	hc.volt = volt;
++	hc.promise = promise;
++	printf("HEROLTE CPU: boot state: pll %#x ema %#x assist %#x vdd_mngs %#x\n", hc.boot_pll, hc.boot_ema, hc.boot_assist, now);
++	if (!hc_go_high()) {
++		return;
+ 	}
+-	hg_wr(sysreg, 0x314, 0x001091b9);       /* MNGS_EMA_CON for 900 mV and more */
+-	hg_wr(sysreg, 0x1040, 0);               /* MNGS_ASSIST_CON */
+-	for (unsigned i = 0; i < sizeof(divs) / sizeof(divs[0]); i++) {
+-		uint32_t mask = (1u << divs[i].bits) - 1;
+-		hg_wr(mngs, divs[i].off, (hg_rd(mngs, divs[i].off) & ~mask) | (divs[i].off == 0x430 ? promise : divs[i].ratio));
+-		delay(20);
++	hc.saved = ((hc.boot_pll >> 16) & 0x3ff) != 0 && now != 0 && now < volt;
++	printf("HEROLTE CPU: Mongoose at %u MHz: vdd_mngs %#x -> %#x, con0 %#x\n", mhz, now, volt, hg_rd(mngs, 0x100));
++	(void)set;
++}
++
++/*
++ * (0330) Sleep and heat. With the screen off (Power, SweetFramebuffer.cpp) for 3 s, or the battery at herohot degrees
++ * (42 by default; the MAX77854's TEMP, herolte_battery.c), the Mongoose cluster goes back to the bootloader's rate and
++ * voltage; with the screen on and the battery 3 degrees cooler, up to herocpu_mhz again. The A53s are left as they are.
++ * Boot-arg heropower=0: none of it. herotmu=0: the SoC's four TMUs are not read; by default they (BOOT DTB tmuctrl@1006x000, no clocks of their own)
++ * are read, nothing written, once a minute after the first two, for their calibration.
++ */
++volatile uint64_t herolte_screen_off_at;        /* mach time the display went off; 0 while it is on */
++volatile int herolte_fg_temp_dc = -10000;       /* the battery, tenths of a degree; -10000 not read */
++
++static const uint32_t hp_tmu_pa[] = { 0x10060000u, 0x10064000u, 0x10068000u, 0x1006c000u };   /* MNGS, APOLLO, GPU, ISP */
++
++static unsigned
++hp_boot_mhz(void)
++{
++	uint32_t m = (hc.boot_pll >> 16) & 0x3ff, p = (hc.boot_pll >> 8) & 0x3f, s = hc.boot_pll & 7;
++	return p ? 26 * m / (p << s) : 0;
++}
++
++static void
++hg_power_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	extern struct processor *cpu_to_processor(int cpu);
++	extern struct processor *thread_bind(struct processor *processor);
++	/*
++	 * (0331) The heat is the SoC's: the battery's TEMP stayed at 28.0 C for a whole session (boot-0330: written by the
++	 * host on Android, not measured). The TMUs read fine (boot-0330) and are calibrated by their own fuses, two points
++	 * as Samsung's exynos8890 data (25 and 85 C): TRIMINFO bits 7:0 the code at 25 C, 15:8 the code at 85 C; their
++	 * CURRENT_TEMP, bits 7:0, gave 44-49 C with the UI running. herohot=N, 80 C by default, back under N - 10.
++	 * herotmu=0: no TMU read at all (and no heat limit).
++	 */
++	uint32_t hot = 80, tmu_on = 1;
++	PE_parse_boot_argn("herohot", &hot, sizeof(hot));
++	PE_parse_boot_argn("herotmu", &tmu_on, sizeof(tmu_on));
++	uint32_t cool = hot > 10 ? hot - 10 : 0;
++	for (unsigned i = 0; i < 300 && !hc.saved; i++) {
++		hg_msleep(1000);
++	}
++	if (!hc.saved) {
++		printf("HEROLTE POWER: the Mongoose cluster's boot state was not saved: left as it is\n");
++		return;
+ 	}
+-	/* the switch: BUS_PLL / 2, 528 MHz */
+-	hg_wr(top, 0x990, hg_rd(top, 0x990) | 1);
+-	hg_wr(top, 0x4f0, (hg_rd(top, 0x4f0) & ~0xfu) | 1);
+-	hc_mux(top, 0x380, 0);
+-	hc_mux(mngs, 0x204, 1);
+-	hc_mux(mngs, 0x208, 1);
+-	con0 = hg_rd(mngs, 0x100);
+-	con0 &= ~((0x3ffu << 16) | (0x3fu << 8) | 7u | (1u << 26));
+-	con0 |= (target_m << 16) | (3u << 8) | (1u << 5);
+-	hg_wr(mngs, 0x000, 3 * 150);            /* MNGS_PLL_LOCK */
+-	hg_wr(mngs, 0x100, con0);
+-	bool locked = false;
+-	for (unsigned i = 0; i < 10000 && !locked; i++) {
+-		delay(1);
+-		locked = (hg_rd(mngs, 0x100) >> 29) & 1;
++	/* (the rate is changed from an A53, as at boot) */
++	thread_bind(cpu_to_processor(0));
++	hg_msleep(1);
++	vm_offset_t tmu[4] = { 0 };
++	int e25[4] = { 0 }, e85[4] = { 0 };
++	unsigned sensors = 0;
++	for (unsigned i = 0; tmu_on && i < 4; i++) {
++		tmu[i] = ml_io_map(hp_tmu_pa[i], 0x1000);
++		if (tmu[i]) {
++			uint32_t trim = hg_rd(tmu[i], 0x0);
++			e25[i] = (int)(trim & 0xff);
++			e85[i] = (int)((trim >> 8) & 0xff);
++			if (e25[i] > 0 && e85[i] > e25[i] + 20) {
++				sensors |= 1u << i;
++			}
++			printf("HEROLTE TMU: %#x: trim %#x: code %d at 25 C, %d at 85 C%s\n", hp_tmu_pa[i], trim, e25[i], e85[i],
++			    sensors & (1u << i) ? "" : " (not used)");
++		}
+ 	}
+-	if (!locked) {
+-		printf("HEROLTE CPU: MNGS_PLL did not lock (%#x): the cores stay on the switch\n", hg_rd(mngs, 0x100));
+-		return;
++	printf("HEROLTE POWER: Mongoose to %u MHz with the screen off or the SoC at %u C (back under %u C)\n", hp_boot_mhz(), hot, cool);
++	bool hot_now = false;
++	uint64_t last_log = 0;
++	int top = -1000, seen_max = -1000;
++	for (;;) {
++		hg_msleep(200);
++		uint64_t now = mach_absolute_time(), off = herolte_screen_off_at, ns = 0;
++		if (off != 0 && now > off) {
++			absolutetime_to_nanoseconds(now - off, &ns);
++		}
++		bool screen_off = off != 0 && ns > 3ull * NSEC_PER_SEC;
++		int c[4] = { -1000, -1000, -1000, -1000 };
++		top = -1000;
++		for (unsigned i = 0; i < 4; i++) {
++			if (!(sensors & (1u << i))) {
++				continue;
++			}
++			int code = (int)(hg_rd(tmu[i], 0x40) & 0xff);
++			int t = (code - e25[i]) * 60 / (e85[i] - e25[i]) + 25;
++			if (t > 0 && t < 130) {
++				c[i] = t;
++				top = t > top ? t : top;
++			}
++		}
++		seen_max = top > seen_max ? top : seen_max;
++		if (top > -1000) {
++			if (top >= (int)hot) {
++				hot_now = true;
++			} else if (top < (int)cool) {
++				hot_now = false;
++			}
++		}
++		bool want_low = screen_off || hot_now;
++		if (!hc.broken && want_low == hc.high) {
++			bool ok = want_low ? hc_go_low() : hc_go_high();
++			printf("HEROLTE POWER: Mongoose %s %u MHz (screen %s%s, SoC %d C)\n", ok ? "to" : "NOT to",
++			    want_low ? hp_boot_mhz() : hc.mhz, screen_off ? "off" : "on", hot_now ? ", hot" : "", top);
++		}
++		uint64_t since = 0;
++		absolutetime_to_nanoseconds(now - last_log, &since);
++		if (last_log == 0 || since > 60ull * NSEC_PER_SEC) {
++			last_log = now;
++			int b = herolte_fg_temp_dc;
++			printf("HEROLTE POWER: SoC %d C (big %d, little %d, GPU %d, ISP %d; most %d), battery reg %d.%u C, Mongoose %s, screen %s\n",
++			    top, c[0], c[1], c[2], c[3], seen_max, b / 10, (unsigned)(b < 0 ? -b : b) % 10, hc.high ? "up" : "down", off ? "off" : "on");
++			seen_max = -1000;
++			/* (0346) per-CPU busy share since the last line, from the scheduler's own idle accounting */
++			extern struct processor *cpu_to_processor(int cpu);
++			extern void processor_cpu_load_info(struct processor *processor, natural_t ticks[4]);
++			static natural_t last[8][4];
++			char line[160];
++			int len = 0;
++			unsigned total_busy = 0, total_all = 0;
++			for (int cpu = 0; cpu < 8; cpu++) {
++				struct processor *pr = cpu_to_processor(cpu);
++				if (!pr) {
++					continue;
++				}
++				natural_t t[4] = { 0, 0, 0, 0 };
++				processor_cpu_load_info(pr, t);
++				unsigned busy = (t[0] - last[cpu][0]) + (t[1] - last[cpu][1]);
++				unsigned all = busy + (t[2] - last[cpu][2]);
++				memcpy(last[cpu], t, sizeof(t));
++				total_busy += busy;
++				total_all += all;
++				len += snprintf(line + len, sizeof(line) - (size_t)len, " %u", all ? busy * 100u / all : 0u);
++			}
++			printf("HEROLTE LOAD: busy %%:%s (all %u%%)\n", line, total_all ? total_busy * 100u / total_all : 0u);
++		}
+ 	}
+-	hc_mux(mngs, 0x208, 0);
+-	hc_mux(mngs, 0x204, 0);
+-	printf("HEROLTE CPU: Mongoose at %u MHz: vdd_mngs %#x -> %#x, con0 %#x\n", mhz, now, volt, hg_rd(mngs, 0x100));
+ }
+ 
+ static void
+@@ -2445,8 +2728,22 @@ ha_codec_setup(void)
+ 			hg_msleep(20);
+ 		}
+ 	}
++	/*
++	 * (0338) The table is what Linux left while it played to the speaker and the earpiece:
++	 * OUT3 (earpiece) mixes AIF1RX1/2 (0x6a0/0x6a2) beside AIF4TX to the MAX98506. With
++	 * heroearpiece=0 OUT3 gets no source and is muted, so media plays on the speaker only.
++	 */
++	int earpiece = 1;
++	PE_parse_boot_argn("heroearpiece", &earpiece, sizeof(earpiece));
++	if (!earpiece) {
++		ha_write(0x6a0, 0);
++		ha_write(0x6a2, 0);
++		ha_write(0x421, 0x380);
++		ha_write(0x425, 0x380);
++	}
+ 	ha_write(0x406, 0x33);
+ 	ha_write(0x400, 0x33);
++	printf("HEROLTE AUDIO: earpiece %s\n", earpiece ? "on" : "off (speaker only)");
+ 	hg_msleep(50);
+ 	uint16_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+ 	ha_read(0x101, &s0);
+@@ -2722,6 +3019,21 @@ ha_tone(void)
+ 		ok = ha_amp_write(ha_amp_table[i][0], ha_amp_table[i][1]) && ok;
+ 	}
+ 	ok = ha_amp_write(0x3a, 0xf8) && ok;
++	/*
++	 * (0339) MAX98506 0x2D: DAC_IN_SEL [6:5] (3 = (L+R)/2, 2 = L+R), SPK_GAIN [4:0] (1 dB steps,
++	 * 0x14 as Samsung's driver). Boot-arg heroampgain=0..31 and heroampsum=1 (L+R, +6 dB).
++	 */
++	{
++		uint32_t gain = 0x14, sum = 0;
++		PE_parse_boot_argn("heroampgain", &gain, sizeof(gain));
++		PE_parse_boot_argn("heroampsum", &sum, sizeof(sum));
++		if (gain > 31) {
++			gain = 31;
++		}
++		uint8_t r2d = (uint8_t)(((sum ? 2u : 3u) << 5) | gain);
++		ok = ha_amp_write(0x2d, r2d) && ok;
++		printf("HEROLTE AUDIO: amplifier gain %u, %s, 0x2d=%#x\n", gain, sum ? "L+R" : "(L+R)/2", r2d);
++	}
+ 	printf("HEROLTE AUDIO: amplifier %s\n", ok ? "answered" : "DID NOT ANSWER");
+ 	ha_step("I2S");
+ 	hg_wr(i2s, 0x00, 1u << 31);             /* CON_RSTCLR: the block out of reset, Linux's QUIRK_NEED_RSTCLR. Until then a write stalls */
+@@ -2913,11 +3225,15 @@ hero_dsim_read(vm_offset_t dsim, uint8_t reg, uint8_t *data, unsigned count)
+ 	}
+ 	hg_wr(dsim, HERO_DSIM_PKTHDR, 0x06u | ((uint32_t)reg << 8)); /* DCS read, automatic turnaround */
+ 	const bool done = hero_dsim_wait(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
+-	uint32_t first = 0;
++	uint32_t first = 0, unexpected = 0, error_report = 0;
+ 	unsigned received = 0;
+ 	bool bad = false;
+ 	for (unsigned i = 0; i < 64 && !(hg_rd(dsim, HERO_DSIM_FIFOCTRL) & HERO_DSIM_RX_EMPTY); i++) {
+ 		const uint32_t hdr = hg_rd(dsim, HERO_DSIM_RXFIFO);
++		/* Samsung DSIM returns this value when the FIFO is drained. */
++		if (hdr == 0x30800002u) {
++			break;
++		}
+ 		const uint32_t type = hdr & 0x3f;
+ 		if (i == 0) {
+ 			first = hdr;
+@@ -2937,18 +3253,26 @@ hero_dsim_read(vm_offset_t dsim, uint8_t reg, uint8_t *data, unsigned count)
+ 					data[received++] = (uint8_t)(word >> (8 * k));
+ 				}
+ 			}
+-		} else if (type != 0x08 && (type != 0x02 || ((hdr >> 8) & 0xffff) != 0)) {
++		} else if (type == 0x02) {
++			/* (0335) Acknowledge and error report: the S6E3HA3 sends one after its reply
++			 * (0x13800402: ECC corrected, protocol violation). Linux only logs these. */
++			error_report = (hdr >> 8) & 0xffff;
++		} else if (type != 0x08) {
++			unexpected = hdr;
+ 			bad = true;
+ 			break;
+ 		}
+ 	}
+ 	const uint32_t final_fifo = hg_rd(dsim, HERO_DSIM_FIFOCTRL);
+ 	hg_wr(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
+-	if (received == count && !bad && (final_fifo & HERO_DSIM_RX_EMPTY)) {
++	if (error_report) {
++		printf("HEROLTE PANEL: DCS %#x reply with error report %#x (ignored)\n", reg, error_report);
++	}
++	if (done && received == count && !bad && (final_fifo & HERO_DSIM_RX_EMPTY)) {
+ 		return true;
+ 	}
+-	printf("HEROLTE PANEL: no valid DCS %#x reply (got %u done %u first %#x fifo %#x)\n",
+-	    reg, received, (unsigned)done, first, final_fifo);
++	printf("HEROLTE PANEL: no valid DCS %#x reply (got %u done %u first %#x unexpected %#x fifo %#x)\n",
++	    reg, received, (unsigned)done, first, unexpected, final_fifo);
+ 	return false;
+ }
+ 
+@@ -3508,6 +3832,11 @@ herolte_gpu_probe(void)
+ 	}
+ 
+ 	PE_parse_boot_argn("herogpu_flush", &hg_flush_mode, sizeof(hg_flush_mode));
++	PE_parse_boot_argn("herogpu_sleep", &hg_sleep_us, sizeof(hg_sleep_us));
++	PE_parse_boot_argn("herogpu_spin", &hg_spin_us, sizeof(hg_spin_us));
++	if (hg_sleep_us) {
++		printf("HEROLTE GPU: client jobs polled %u us, then sleep %u us between polls\n", hg_spin_us, hg_sleep_us);
++	}
+ 	int wifi = 1;                                           /* herowifi=0: no Wi-Fi */
+ 	PE_parse_boot_argn("herowifi", &wifi, sizeof(wifi));
+ 	if (wifi &&
+@@ -3527,6 +3856,12 @@ herolte_gpu_probe(void)
+ 	    kernel_thread_start(hg_audio_thread, (void *)(uintptr_t)audio, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	int power = 1;                                          /* heropower=0: no sleep or heat rates (0330) */
++	PE_parse_boot_argn("heropower", &power, sizeof(power));
++	if (power &&
++	    kernel_thread_start(hg_power_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	PE_parse_boot_argn("herogpu", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		printf("HEROLTE GPU: probe disabled\n");
+diff --git a/bsd/dev/herolte_touch.c b/bsd/dev/herolte_touch.c
+index a2772e1..125567f 100644
+--- a/bsd/dev/herolte_touch.c
++++ b/bsd/dev/herolte_touch.c
+@@ -15,6 +15,7 @@
+  * Boot-arg herotouch=0 disables everything here.
+  */
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <kern/locks.h>
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+@@ -410,9 +411,27 @@ apm_start(void)
+ 	return true;
+ }
+ 
+-/* samsung_mbox_send_data() + samsung_mbox_last_tx_done(), polled. */
++/*
++ * (0343) One message at a time: the touch power-on, the clock code's voltages (herolte_gpu.c) and the vibration
++ * motor's LDO34 all use this mailbox, and two senders' TX_MSG words interleaved would write one PMIC register with
++ * another's value.
++ */
++static LCK_GRP_DECLARE(apm_grp, "herolte_apm");
++static LCK_MTX_DECLARE(apm_mtx, &apm_grp);
++static bool apm_message_locked(uint32_t msg0, uint32_t msg1, uint32_t msg2, uint32_t *reply);
++
+ static bool
+ apm_message(uint32_t msg0, uint32_t msg1, uint32_t msg2, uint32_t *reply)
++{
++	lck_mtx_lock(&apm_mtx);
++	bool ok = apm_message_locked(msg0, msg1, msg2, reply);
++	lck_mtx_unlock(&apm_mtx);
++	return ok;
++}
++
++/* samsung_mbox_send_data() + samsung_mbox_last_tx_done(), polled. */
++static bool
++apm_message_locked(uint32_t msg0, uint32_t msg1, uint32_t msg2, uint32_t *reply)
+ {
+ 	unsigned n;
+ 	for (n = 0; n < 10000 && ((ht_rd(apm_mbox, MBOX_RX_IRQ0) & 1u) ||
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index 9778ac0..280ded9 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -98,8 +98,56 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ #define SWEET_TOP_PROCS 512
+ static struct { int pid; uint64_t abs; char name[20]; uint64_t delta; } sweet_top[SWEET_TOP_PROCS];
+ static unsigned sweet_top_n;
++static int sweet_top_print;
+ static uint64_t sweet_top_gen;
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * WidgetKit extensions with a CPU limit of their own (boot-arg herowidgetcap=N percent of one core, default 30, 0 off).
++ * CalendarWidgetExtension re-evaluated its SwiftUI graph without end (AttributeGraph AGGraphGetValue in every sample,
++ * boot-cal): two cores at 100% for the whole session, the phone's heat, and the cores the window server needed.
++ * Refusing it was worse (0315: SpringBoard kept asking for it) and PRIO_DARWIN_BG did nothing while cores were idle
++ * (hero-run, boot-0323t: still 199%). XNU's own task-wide CPU limit (proc_set_task_ruse_cpu, THROTTLE: the task's
++ * threads block once the share of each second is spent) lets it run and draw, at a fixed cost.
++ */
++#define HERO_RUSE_THROTTLE 0x01         /* TASK_POLICY_RESOURCE_ATTRIBUTE_THROTTLE, osfmk/kern/policy_internal.h */
++extern int proc_set_task_ruse_cpu(task_t task, uint16_t policy, uint8_t percentage, uint64_t interval, uint64_t deadline,
++    int cpumon_entitled);
++
++static void
++sweet_top_cap(task_t task, const char *name)
++{
++	static int percent = -1;
++	static unsigned told;
++	if (percent < 0) {
++		percent = 30;
++		PE_parse_boot_argn("herowidgetcap", &percent, sizeof(percent));
++	}
++	/*
++	 * (0347) com.apple.voicemail.vmd, with no telephony here, spins two cores for the whole session (sweettop, pwr13b:
++	 * "vmd 193%" in every 5 s sample, little cores ~50% busy on an idle home screen). Boot-arg herovmdcap=N percent of
++	 * a core, default 5, 0 off.
++	 */
++	static int vmd_percent = -1;
++	if (vmd_percent < 0) {
++		vmd_percent = 5;
++		PE_parse_boot_argn("herovmdcap", &vmd_percent, sizeof(vmd_percent));
++	}
++	bool widget = false;
++	for (const char *c = name; *c != '\0' && !widget; c++) {
++		widget = strncmp(c, "Widge", 5) == 0;
++	}
++	int limit = widget ? percent : strcmp(name, "vmd") == 0 ? vmd_percent : 0;
++	if (limit <= 0 || limit > 100) {
++		return;
++	}
++	int err = proc_set_task_ruse_cpu(task, HERO_RUSE_THROTTLE, (uint8_t)limit, 0, 0, 1);
++	if (told++ < 24) {
++		printf("HEROLTE CAP: %s limited to %d%% of a core: %d\n", name, limit, err);
++	}
++}
++#endif
++
+ static int
+ sweet_top_proc(proc_t p, __unused void *arg)
+ {
+@@ -126,6 +174,9 @@ sweet_top_proc(proc_t p, __unused void *arg)
+ 		sweet_top[i].pid = pid;
+ 		sweet_top[i].abs = abs;         /* first sight: no delta yet */
+ 		proc_name(pid, sweet_top[i].name, sizeof(sweet_top[i].name));
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		sweet_top_cap(task, sweet_top[i].name);
++#endif
+ 	}
+ 	sweet_top[i].delta = abs > sweet_top[i].abs ? abs - sweet_top[i].abs : 0;
+ 	sweet_top[i].abs = abs;
+@@ -142,7 +193,7 @@ sweet_top_thread(__unused void *arg, __unused wait_result_t wr)
+ 			sweet_top[i].delta = 0;
+ 		}
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_top_proc, NULL, NULL, NULL);
+-		if (sweet_top_gen++ == 0) {
++		if (sweet_top_gen++ == 0 || !sweet_top_print) {
+ 			continue;               /* the first pass only takes the baseline */
+ 		}
+ 		char line[400];
+@@ -180,8 +231,14 @@ sweet_sample_start(void)
+ 		thread_deallocate(thread);
+ 	}
+ 	int top = 0;
+-	if (PE_parse_boot_argn("sweettop", &top, sizeof(top)) && top &&
+-	    kernel_thread_start(sweet_top_thread, NULL, &thread) == KERN_SUCCESS) {
++	sweet_top_print = PE_parse_boot_argn("sweettop", &top, sizeof(top)) && top;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* (0347) the CPU caps live in this sampler: run it in every boot, quietly without sweettop */
++	top = 1;
++#else
++	top = sweet_top_print;
++#endif
++	if (top && kernel_thread_start(sweet_top_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 6d8a0fd..dce6fab 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,61 @@
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ /* bsd/dev/herolte_battery.c: MAX77854 fuel gauge, read-only. */
+ extern "C" int herolte_fg_init(void);
++extern "C" int herolte_chg_state(bool *external, bool *charging, bool *full);
++extern "C" void herolte_vib_init(void);
++extern "C" volatile int herolte_fg_temp_dc;         /* 0.1 C, bsd/dev/herolte_battery.c */
++extern "C" volatile unsigned herolte_fg_cycles;
++extern "C" void herolte_vib_pattern(uint32_t on_ms, uint32_t off_ms, bool repeat, uint32_t intensity_q16);
++
++/*
++ * (0344) iOS 16's MediaExperience (FigVibrator_IOKit.c, used when libVibeSynthEngine reports no haptic hardware):
++ * IOServiceGetMatchingService(IOServiceNameMatching("vibrator")), then IORegistryEntrySetCFProperties with
++ * { hertz_millisecs: [ { intensity: 16.16 fixed }, on ms, bool, off ms ], repeat: bool } to start, and another
++ * hertz_millisecs (repeat false) to stop. The same lookup answers "has a vibrator".
++ */
++class SweetVibrator : public IOService {
++	OSDeclareDefaultStructors(SweetVibrator);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(SweetVibrator, IOService);
++
++IOReturn
++SweetVibrator::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	static unsigned logged;
++	if (logged < 16) {
++		logged++;
++		OSSerialize *ser = OSSerialize::withCapacity(256);
++		if (ser && d->serialize(ser)) {
++			IOLog("SWEET VIBRATOR: %.400s\n", ser->text());
++		}
++		OSSafeReleaseNULL(ser);
++	}
++	OSArray *a = OSDynamicCast(OSArray, d->getObject("hertz_millisecs"));
++	OSBoolean *repeat = OSDynamicCast(OSBoolean, d->getObject("repeat"));
++	uint32_t ms[2] = { 0, 0 }, q16 = 0;
++	unsigned n = 0;
++	for (unsigned i = 0; a && i < a->getCount(); i++) {
++		OSObject *o = a->getObject(i);
++		OSNumber *num = OSDynamicCast(OSNumber, o);
++		OSDictionary *sub = OSDynamicCast(OSDictionary, o);
++		if (num && n < 2) {
++			ms[n++] = num->unsigned32BitValue();
++		} else if (sub) {
++			OSNumber *in = OSDynamicCast(OSNumber, sub->getObject("intensity"));
++			if (in) {
++				q16 = in->unsigned32BitValue();
++			}
++		}
++	}
++	herolte_vib_pattern(ms[0], ms[1], repeat && repeat->isTrue(), q16);
++	return kIOReturnSuccess;
++}
+ extern "C" int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma,
+     unsigned *rem_mah, unsigned *full_mah);
+ #define BATTERY_DESIGN_MAH 3000u        /* SM-G930F EB-BG930ABE */
+@@ -124,7 +179,11 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+ 	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	setCycleCount(measured ? herolte_fg_cycles : 0);
++#else
+ 	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++#endif
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+@@ -132,11 +191,21 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putNumber("DesignCapacity", BATTERY_DESIGN_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* (0345) the gauge's TEMP (0.1 C) as centidegrees; 25 C without a measurement */
++	const int tdc = herolte_fg_temp_dc;
++	const bool tvalid = measured && tdc > -200 && tdc < 800;
++	putNumber("Temperature", tvalid ? (UInt32)(tdc * 10) : 2500);
++	putBool("SweetBatteryTemperatureEstimated", !tvalid);
++#else
+ 	putNumber("Temperature", 2500);
++#endif
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
++#if !defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	putBool("SweetBatteryTemperatureEstimated", true);
++#endif
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -230,14 +299,45 @@ SweetBattery::poll(void)
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
+ 	}
+-	/* No charger driver: the gauge's charge current marks a cable. */
+-	bool charging = ma > 20;
++	/* (0342) The charger's own state; without an answer, the gauge's charge current marks a cable. */
++	bool external = ma > 20, charging = ma > 20, isFull = false;
++	bool e = false, c = false, f = false;
++	if (herolte_chg_state(&e, &c, &f) == 0) {
++		external = e;
++		charging = c;
++		isFull = f;
++	}
++	static uint32_t delay_s = 0xffffffffu;
++	static uint64_t first_poll;
++	if (delay_s == 0xffffffffu) {
++		delay_s = 0;
++		PE_parse_boot_argn("herochgdelay", &delay_s, sizeof(delay_s));
++		first_poll = mach_absolute_time();
++	}
++	if (delay_s && external) {
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - first_poll, &ns);
++		if (ns < (uint64_t)delay_s * NSEC_PER_SEC) {
++			external = charging = isFull = false;
++		} else {
++			IOLog("SWEET BATTERY: cable reported after %u s (herochgdelay)\n", delay_s);
++			delay_s = 0;
++		}
++	}
+ 	static unsigned logged;
+-	if (logged++ % 10 == 0) {
+-		IOLog("SWEET BATTERY: %u%% %umV %dmA rem=%umAh full=%umAh\n",
+-		    percent, mv, ma, rem, full);
++	static int every = -1;
++	if (every < 0) {
++		every = 10;
++		int v = 0;
++		if (PE_parse_boot_argn("herobattlog", &v, sizeof(v)) && v == 1) {
++			every = 1;       /* (0346) every poll, for power measurements */
++		}
++	}
++	if (logged++ % (unsigned)every == 0) {
++		IOLog("SWEET BATTERY: %u%% %umV %dmA rem=%umAh full=%umAh external=%d charging=%d done=%d\n",
++		    percent, mv, ma, rem, full, external, charging, isFull);
+ 	}
+-	publish(percent, mv, ma, charging, charging, charging, false, true, true);
++	publish(isFull && percent >= 95 ? 100 : percent, mv, ma, external, external, charging, isFull, true, true);
+ }
+ #else
+ void
+@@ -290,7 +390,11 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		sender->setTimeoutMS(10000);
++#else
+ 		sender->setTimeoutMS(30000);
++#endif
+ 	}
+ }
+ 
+@@ -303,6 +407,20 @@ SweetBattery::start(IOService *provider)
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	/* Default on; herofg=0 keeps the static fallback. */
+ 	fReal = herolte_fg_init() == 0;
++	herolte_vib_init();
++	SweetVibrator *vib = OSTypeAlloc(SweetVibrator);
++	if (vib && vib->init()) {
++		vib->setName("vibrator");
++		if (vib->attach(this)) {
++			if (vib->start(this)) {
++				vib->registerService();
++				IOLog("SWEET VIBRATOR: registered\n");
++			} else {
++				vib->detach(this);
++			}
++		}
++	}
++	OSSafeReleaseNULL(vib);
+ #else
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 46b967c..8f5d1eb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,7 @@ extern "C" uint64_t a5xelte_power_pressed_at;   /* bsd/dev/a5xelte_keys.c */
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+@@ -76,6 +77,15 @@ extern "C" bool herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, u
+ /* Two panel buffers (herofb2): the Mali draws into the one not shown; the CPU writes only the first, shown first. */
+ extern "C" bool herolte_fb_two_buffers(void);
+ extern "C" void herolte_fb_primary(void);
++extern "C" volatile uint64_t herolte_screen_off_at;    /* bsd/dev/herolte_gpu.c (0330) */
++/*
++ * (0340) Frame timing as the window server delivers it: for every swap the time since the vsync tick before it
++ * (CoreAnimation starts a frame on a tick), since the swap before it, and the GPU job time in between.
++ */
++extern "C" volatile uint64_t herolte_gpu_busy_us;
++static volatile uint64_t sweet_fb_tick_at;
++static uint64_t sweet_fb_prev_swap_at, sweet_fb_gpu_at_swap, sweet_fb_lat_sum_us, sweet_fb_lat_max_us, sweet_fb_timed;
++static uint32_t sweet_fb_lat[7], sweet_fb_int[6], sweet_fb_gpu[6];
+ #endif
+ 
+ enum {
+@@ -178,9 +188,13 @@ public:
+ 	uint64_t      fFadeWork;
+ 	uint32_t      fBrightnessTraceBudget; /* protected by fLock */
+ 	bool          fBrightnessTrace;
++	uint32_t      fBrightLogged;
+ #endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++#endif
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -217,6 +231,131 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * (0348) iOS 16's CoreBrightness sets the panel level with IORegistryEntrySetCFProperty(<IOMobileFramebuffer>,
++ * "IOMFBBrightnessLevel", CFNumber) (CoreBrightness 0x1af016810). Without setProperties here IOService answered
++ * kIOReturnUnsupported. The level is kept (readable as the same property, and herolte_bright_level for the panel code)
++ * and logged: the first 24 values, then every change of more than 1/16 of the last one.
++ */
++extern "C" volatile uint32_t herolte_bright_level;
++volatile uint32_t herolte_bright_level;
++
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *level = OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel"));
++	if (!level) {
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++		OSSymbol *key = it ? OSDynamicCast(OSSymbol, it->getNextObject()) : NULL;
++		if (fBrightLogged < 64) {
++			fBrightLogged++;
++			IOLog("SWEET FB: setProperties %s (%u keys) unsupported\n", key ? key->getCStringNoCopy() : "?", d->getCount());
++		}
++		OSSafeReleaseNULL(it);
++		return kIOReturnUnsupported;
++	}
++	uint32_t v = level->unsigned32BitValue(), last = herolte_bright_level;
++	uint32_t diff = v > last ? v - last : last - v;
++	if (fBrightLogged < 24 || diff > last / 16) {
++		fBrightLogged++;
++		IOLog("SWEET FB: IOMFBBrightnessLevel %u (%#x, %u bits)\n", v, v, level->numberOfBits());
++	}
++	herolte_bright_level = v;
++	setProperty("IOMFBBrightnessLevel", level);
++	return kIOReturnSuccess;
++}
++#endif
++
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * (0349) CoreBrightness (BCAppleBacklightBrtControl) finds its backlight with IOServiceGetMatchingServices(
++ * { IOPropertyMatch: { backlight-control: ... } }) and reads IODisplayParameters (brightness, BrightnessMilliNits),
++ * MinNits/MaxNits and optional nits tables from it. Nothing here had that property, so the brightness system had no
++ * backlight. Boot-arg herobacklight=1: a service with those properties, logging every property set it receives.
++ * No panel write yet.
++ */
++class SweetBacklight : public IOService {
++	OSDeclareDefaultStructors(SweetBacklight);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	bool setupParameters(void);
++	uint32_t fLogged;
++};
++OSDefineMetaClassAndStructors(SweetBacklight, IOService);
++
++static OSDictionary *
++sweet_backlight_param(uint32_t min, uint32_t max, uint32_t value)
++{
++	OSDictionary *d = OSDictionary::withCapacity(3);
++	OSNumber *a = OSNumber::withNumber(min, 32), *b = OSNumber::withNumber(max, 32), *c = OSNumber::withNumber(value, 32);
++	if (d && a && b && c) {
++		d->setObject("min", a);
++		d->setObject("max", b);
++		d->setObject("value", c);
++	}
++	OSSafeReleaseNULL(a);
++	OSSafeReleaseNULL(b);
++	OSSafeReleaseNULL(c);
++	return d;
++}
++
++bool
++SweetBacklight::setupParameters(void)
++{
++	OSDictionary *params = OSDictionary::withCapacity(2);
++	OSDictionary *brightness = sweet_backlight_param(0, 65536, 32768);
++	OSDictionary *millinits = sweet_backlight_param(2000, 500000, 250000);
++	bool ok = params && brightness && millinits;
++	if (ok) {
++		params->setObject("brightness", brightness);
++		params->setObject("BrightnessMilliNits", millinits);
++		setProperty("IODisplayParameters", params);
++		setProperty("backlight-control", true);
++		setProperty("MinNits", 2ULL, 32);
++		setProperty("MaxNits", 500ULL, 32);
++		setProperty("MaxNitsPanel", 500ULL, 32);
++		setProperty("user-accessible-max-nits", 500ULL, 32);
++	}
++	OSSafeReleaseNULL(params);
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(millinits);
++	return ok;
++}
++
++IOReturn
++SweetBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	if (fLogged < 200) {
++		fLogged++;
++		OSSerialize *ser = OSSerialize::withCapacity(256);
++		if (ser && d->serialize(ser)) {
++			IOLog("SWEET BACKLIGHT: set %.400s\n", ser->text());
++		}
++		OSSafeReleaseNULL(ser);
++	}
++	/* keep what was set readable, as a backlight driver would */
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++	for (OSSymbol *key = it ? OSDynamicCast(OSSymbol, it->getNextObject()) : NULL; key;
++	    key = OSDynamicCast(OSSymbol, it->getNextObject())) {
++		OSNumber *n = OSDynamicCast(OSNumber, d->getObject(key));
++		if (n) {
++			setProperty(key, n);
++		}
++	}
++	OSSafeReleaseNULL(it);
++	return kIOReturnSuccess;
++}
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -397,6 +536,24 @@ AppleCLCD::start(IOService *provider)
+ 	{
+ 		setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	{
++		int backlight = 0;
++		if (PE_parse_boot_argn("herobacklight", &backlight, sizeof(backlight)) && backlight == 1) {
++			SweetBacklight *bl = OSTypeAlloc(SweetBacklight);
++			if (bl && bl->init() && bl->setupParameters() && bl->attach(this)) {
++				bl->setName("backlight");
++				if (bl->start(this)) {
++					bl->registerService();
++					IOLog("SWEET BACKLIGHT: registered (backlight-control)\n");
++				} else {
++					bl->detach(this);
++				}
++			}
++			OSSafeReleaseNULL(bl);
++		}
++	}
++#endif
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -506,6 +663,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = fb->fVsyncNext ? fb->fVsyncNext : mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_fb_tick_at = mach_absolute_time();
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -558,6 +716,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				    last + 1, elapsed / 1000, work / 1000);
+ 			}
+ 		}
++		if (step > last) {
++			/* (0330) black and off: 5 ticks a second instead of 60, so that whatever waits for them sleeps */
++			fb->fVsyncNext = 0;
++			sender->setTimeoutMS(200);
++			return;
++		}
+ #endif
+ 		fb->rearmVsync(sender);
+ 		return;
+@@ -619,6 +783,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			    fb->fPerfNS / fb->fPerfFrames / 1000, fb->fPerfMaxNS / 1000, fb->fVsyncMissed,
+ 			    fb->fGaps[0], fb->fGaps[1], fb->fGaps[2], fb->fGaps[3], fb->fSwaps, fb->fOverwritten, fb->fVblSent);
+ 		}
++		if (sweet_fb_timed != 0) {
++			IOLog("HEROLTE FRAME: after tick ms <4/<8/<12/<16/<20/<33/33+ %u/%u/%u/%u/%u/%u/%u avg %llu us max %llu us"
++			    " | swap to swap <12/<18/<25/<35/<50/50+ %u/%u/%u/%u/%u/%u | gpu ms <1/<2/<4/<8/<16/16+ %u/%u/%u/%u/%u/%u\n",
++			    sweet_fb_lat[0], sweet_fb_lat[1], sweet_fb_lat[2], sweet_fb_lat[3], sweet_fb_lat[4], sweet_fb_lat[5],
++			    sweet_fb_lat[6], sweet_fb_lat_sum_us / sweet_fb_timed, sweet_fb_lat_max_us,
++			    sweet_fb_int[0], sweet_fb_int[1], sweet_fb_int[2], sweet_fb_int[3], sweet_fb_int[4], sweet_fb_int[5],
++			    sweet_fb_gpu[0], sweet_fb_gpu[1], sweet_fb_gpu[2], sweet_fb_gpu[3], sweet_fb_gpu[4], sweet_fb_gpu[5]);
++		}
++		bzero(sweet_fb_lat, sizeof(sweet_fb_lat));
++		bzero(sweet_fb_int, sizeof(sweet_fb_int));
++		bzero(sweet_fb_gpu, sizeof(sweet_fb_gpu));
++		sweet_fb_lat_sum_us = sweet_fb_lat_max_us = sweet_fb_timed = 0;
+ 		bzero(fb->fGaps, sizeof(fb->fGaps));
+ 		fb->fSwaps = fb->fOverwritten = fb->fVblSent = 0;
+ 		fb->fPerfFrames = fb->fPerfBytes = fb->fPerfNS = fb->fPerfMaxNS = 0;
+@@ -777,6 +953,41 @@ sweet_fb_copy_rows(uintptr_t dst, uint64_t dstStride, uintptr_t src, uint64_t sr
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	{
++		uint64_t t = mach_absolute_time(), lat = 0, gap = 0;
++		uint64_t gpu = herolte_gpu_busy_us, g = gpu - sweet_fb_gpu_at_swap;
++		sweet_fb_gpu_at_swap = gpu;
++		if (sweet_fb_tick_at != 0 && t >= sweet_fb_tick_at) {
++			absolutetime_to_nanoseconds(t - sweet_fb_tick_at, &lat);
++			lat /= 1000;
++			static const uint64_t lb[6] = { 4000, 8000, 12000, 16000, 20000, 33000 };
++			unsigned i = 0;
++			while (i < 6 && lat >= lb[i]) {
++				i++;
++			}
++			sweet_fb_lat[i]++;
++			sweet_fb_lat_sum_us += lat;
++			sweet_fb_lat_max_us = lat > sweet_fb_lat_max_us ? lat : sweet_fb_lat_max_us;
++			sweet_fb_timed++;
++		}
++		if (sweet_fb_prev_swap_at != 0) {
++			absolutetime_to_nanoseconds(t - sweet_fb_prev_swap_at, &gap);
++			gap /= 1000;
++			static const uint64_t ib[5] = { 12000, 18000, 25000, 35000, 50000 };
++			unsigned i = 0;
++			while (i < 5 && gap >= ib[i]) {
++				i++;
++			}
++			sweet_fb_int[i]++;
++			static const uint64_t gb[5] = { 1000, 2000, 4000, 8000, 16000 };
++			unsigned k = 0;
++			while (k < 5 && g >= gb[k]) {
++				k++;
++			}
++			sweet_fb_gpu[k]++;
++		}
++		sweet_fb_prev_swap_at = t;
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fSwaps++;
+@@ -1310,6 +1521,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++			/* (0330) the cores' rates follow it: bsd/dev/herolte_gpu.c, hg_power_thread */
++			herolte_screen_off_at = off ? mach_absolute_time() : 0;
++#endif
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 2b6ce2d..ae0b994 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -101,7 +101,18 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		/*
++		 * (0334) The cache mode of the surface, not always write-combine. A surface over the
++		 * client's own memory (0259) is that client's malloc object: a write-combine memory
++		 * entry turns the whole object non-cacheable (vm_object_change_wimg_mode), and the
++		 * next LDXR/STXR the client does there (objc retain/release, no LSE on the A53)
++		 * stops with FSC 0x35: backboardd SIGBUS in libobjc, the UI back at the lock screen.
++		 */
++		kernelMap = memory->map(mapCache);
++#else
+ 		kernelMap = memory->map(kIOMapWriteCombineCache);
++#endif
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -637,6 +648,12 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		/*
++		 * (0337) IOSurfaceClientGetBytesPerRowOfPlane reads the plane's pitch here
++		 * (client + 0xe0 + i * 0x80, iOS 16.7); only +0x08 was set, so planar
++		 * surfaces reported 0 and H264SW stepped 4 GiB per row into the cache.
++		 */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+@@ -691,6 +708,10 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+ 	return ret;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++static int sweet_surface_planar_logged;
++#endif
++
+ IOReturn
+ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ {
+@@ -827,6 +848,24 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		return ret;
+ 	}
+ 	ret = returnSurface(s, args);   /* takes the creator's user count */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* (0336) where a planar surface landed in its creator, and its planes */
++	if (ret == kIOReturnSuccess && s->planeCount > 0 && sweet_surface_planar_logged < 24) {
++		sweet_surface_planar_logged++;
++		IOLockLock(fLock);
++		SweetSurfaceRef *ref = findRef(s->id, NULL);
++		unsigned long long at = ref != NULL && ref->data != NULL ? (unsigned long long)ref->data->getAddress() : 0ULL;
++		IOLockUnlock(fLock);
++		IOLog("SWEET SURF: id %u planar at 0x%llx alloc %u offset %u\n", s->id,
++		    at,
++		    s->allocSize, s->offset);
++		for (uint32_t i = 0; i < s->planeCount; i++) {
++			IOLog("SWEET SURF:   id %u plane %u %ux%u bpr %u offset %u size %u bpe %u\n", s->id, i,
++			    s->planes[i].width, s->planes[i].height, s->planes[i].bytesPerRow, s->planes[i].offset,
++			    s->planes[i].size, s->planes[i].bytesPerElement);
++		}
++	}
++#endif
+ 	s->release();
+ 	return ret;
+ }
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 9f9e4aa..c029b96 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -1468,7 +1468,7 @@ pmap_set_xprr_perm(
+ {
+ 	pvh_assert_locked(pai);
+ 
+-	const vm_offset_t kva = phystokv(vm_first_phys + (pmap_paddr_t)ptoa(pai));
++	const vm_offset_t kva = phystokv(pmap_pai_to_phys(pai));
+ 	pt_entry_t * const ptep = pmap_pte(kernel_pmap, kva);
+ 
+ 	pmap_set_pte_xprr_perm(ptep, expected_perm, new_perm);
+@@ -2568,6 +2568,10 @@ pmap_virtual_region(
+ 
+ static unsigned int avail_page_count = 0;
+ static bool need_ram_ranges_init = true;
++#if defined(__arm64__)
++static uint32_t hakios_next_ram_bank = 1;
++static uint64_t hakios_next_bank_page;
++#endif
+ 
+ 
+ /**
+@@ -2600,6 +2604,10 @@ initialize_ram_ranges(void)
+ 	assert(first == (first & ~PAGE_MASK));
+ 	assert(end == (end & ~PAGE_MASK));
+ 	avail_page_count = atop(end - first);
++#if defined(__arm64__)
++	if (hakios_managed_ram.count > 1)
++		avail_page_count += (unsigned int)(hakios_managed_ram.total_pages - hakios_managed_ram.bank[0].pages);
++#endif
+ 
+ 	need_ram_ranges_init = false;
+ }
+@@ -2621,6 +2629,9 @@ pmap_free_pages_span(
+ 	if (need_ram_ranges_init) {
+ 		initialize_ram_ranges();
+ 	}
++#if defined(__arm64__)
++	if (hakios_managed_ram.count > 1) return avail_page_count;
++#endif
+ 	return (unsigned int)atop(avail_end - first_avail);
+ }
+ 
+@@ -2650,6 +2661,19 @@ pmap_next_page(
+ 		--avail_page_count;
+ 		return TRUE;
+ 	}
++#if defined(__arm64__)
++	while (hakios_next_ram_bank < hakios_managed_ram.count) {
++		const struct hakios_ram_bank *bank = &hakios_managed_ram.bank[hakios_next_ram_bank];
++		if (hakios_next_bank_page < bank->pages) {
++			*pnum = (ppnum_t)atop(bank->base) + (ppnum_t)hakios_next_bank_page++;
++			assert(avail_page_count > 0);
++			--avail_page_count;
++			return TRUE;
++		}
++		++hakios_next_ram_bank;
++		hakios_next_bank_page = 0;
++	}
++#endif
+ 	assert(avail_page_count == 0);
+ 	return FALSE;
+ }
+@@ -3928,7 +3952,7 @@ pmap_set_ptov_ap(unsigned int pai __unused, unsigned int ap __unused, boolean_t
+ {
+ #if __ARM_PTE_PHYSMAP__
+ 	pvh_assert_locked(pai);
+-	vm_offset_t kva = phystokv(vm_first_phys + (pmap_paddr_t)ptoa(pai));
++	vm_offset_t kva = phystokv(pmap_pai_to_phys(pai));
+ 	pt_entry_t *pte_p = pmap_pte(kernel_pmap, kva);
+ 
+ 	pt_entry_t tmplate = *pte_p;
+@@ -7455,6 +7479,17 @@ pmap_disconnect(
+ boolean_t
+ pmap_has_managed_page(ppnum_t first, ppnum_t last)
+ {
++#if defined(__arm64__)
++	if (hakios_managed_ram.count > 1) {
++		if (first > last) return FALSE;
++		for (uint32_t i = 0; i < hakios_managed_ram.count; ++i) {
++			const struct hakios_ram_bank *bank = &hakios_managed_ram.bank[i];
++			if (ptoa(first) < bank->base + (bank->pages << PAGE_SHIFT) && bank->base <= ptoa(last))
++				return TRUE;
++		}
++		return FALSE;
++	}
++#endif
+ 	if (ptoa(first) >= vm_last_phys) {
+ 		return FALSE;
+ 	}
+@@ -8654,7 +8689,7 @@ pmap_set_ppl_hashed_flag(const pmap_paddr_t addr)
+ MARK_AS_PMAP_TEXT void
+ pmap_clear_ppl_hashed_flag_all(void)
+ {
+-	const unsigned int last_index = pa_index(vm_last_phys);
++	const unsigned int last_index = pmap_managed_page_count();
+ 	pv_entry_t **pv_h = NULL;
+ 
+ 	for (int pai = 0; pai < last_index; ++pai) {
+@@ -8678,7 +8713,7 @@ pmap_clear_ppl_hashed_flag_all(void)
+ MARK_AS_PMAP_TEXT void
+ pmap_check_ppl_hashed_flag_all(void)
+ {
+-	const unsigned int last_index = pa_index(vm_last_phys);
++	const unsigned int last_index = pmap_managed_page_count();
+ 	pv_entry_t **pv_h = NULL;
+ 
+ 	for (int pai = 0; pai < last_index; ++pai) {
+diff --git a/osfmk/arm/pmap/pmap_data.c b/osfmk/arm/pmap/pmap_data.c
+index d8592c4..84e343e 100644
+--- a/osfmk/arm/pmap/pmap_data.c
++++ b/osfmk/arm/pmap/pmap_data.c
+@@ -1221,8 +1221,13 @@ pmap_enqueue_pages(vm_page_t mem)
+ 	vm_page_t m_prev;
+ 	vm_object_lock(pmap_object);
+ 	while (mem != VM_PAGE_NULL) {
++		/*
++		 * HEROLTE (RAM banks, 0326): the page's compact index, not its distance from gPhysBase. The extra banks lie
++		 * below the boot bank (0x9xxxxxxx under 0x880000000): pa - gPhysBase went negative and vm_page_insert
++		 * panicked, "inserted at offset past object bounds" (pmap_object is mem_size long). One bank: the same.
++		 */
+ 		const vm_object_offset_t offset =
+-		    (vm_object_offset_t) ((ptoa(VM_PAGE_GET_PHYS_PAGE(mem))) - gPhysBase);
++		    (vm_object_offset_t) ptoa(pa_index(ptoa(VM_PAGE_GET_PHYS_PAGE(mem))));
+ 
+ 		vm_page_insert_wired(mem, pmap_object, offset, VM_KERN_MEMORY_PTE);
+ 		m_prev = mem;
+@@ -1545,7 +1550,7 @@ pmap_pages_free(pmap_paddr_t pa, __assert_only unsigned size)
+ 		 * Remove the page from the pmap's VM object and return it back to the
+ 		 * VM's global free list of pages.
+ 		 */
+-		mem = vm_page_lookup(pmap_object, (pa - gPhysBase));
++		mem = vm_page_lookup(pmap_object, ptoa(pa_index(pa)));  /* (as pmap_enqueue_pages puts it) */
+ 		assert(mem != VM_PAGE_NULL);
+ 		assert(VM_PAGE_WIRED(mem));
+ 		vm_page_lock_queues();
+diff --git a/osfmk/arm/pmap/pmap_data.h b/osfmk/arm/pmap/pmap_data.h
+index 2883f63..3dc23db 100644
+--- a/osfmk/arm/pmap/pmap_data.h
++++ b/osfmk/arm/pmap/pmap_data.h
+@@ -35,6 +35,7 @@
+ #define _ARM_PMAP_PMAP_DATA_H_
+ 
+ #include <stdint.h>
++#include <arm64/hakios_ram_banks.h>
+ 
+ #include <kern/ledger.h>
+ #include <mach/vm_types.h>
+@@ -74,6 +75,12 @@ extern pmap_paddr_t vm_first_phys, vm_last_phys;
+ static inline bool
+ pa_valid(pmap_paddr_t pa)
+ {
++#if defined(__arm64__)
++	if (hakios_managed_ram.count > 1) {
++		uint64_t index;
++		return hakios_ram_pa_index(&hakios_managed_ram, pa, &index);
++	}
++#endif
+ 	return (pa >= vm_first_phys) && (pa < vm_last_phys);
+ }
+ 
+@@ -97,9 +104,30 @@ pa_valid(pmap_paddr_t pa)
+ static inline unsigned int
+ pa_index(pmap_paddr_t pa)
+ {
++#if defined(__arm64__)
++	if (hakios_managed_ram.count > 1) return (unsigned int)hakios_ram_pmap_index(pa);
++#endif
+ 	return (unsigned int)atop(pa - vm_first_phys);
+ }
+ 
++static inline pmap_paddr_t
++pmap_pai_to_phys(unsigned int index)
++{
++#if defined(__arm64__)
++	if (hakios_managed_ram.count > 1) return hakios_ram_pmap_pa(index);
++#endif
++	return vm_first_phys + (pmap_paddr_t)ptoa(index);
++}
++
++static inline unsigned int
++pmap_managed_page_count(void)
++{
++#if defined(__arm64__)
++	if (hakios_managed_ram.count > 1) return (unsigned int)hakios_managed_ram.total_pages;
++#endif
++	return (unsigned int)atop(vm_last_phys - vm_first_phys);
++}
++
+ /* See the definition of pv_head_table for more information. */
+ extern pv_entry_t **pv_head_table;
+ 
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index fbc383d..0c91ee0 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -345,6 +345,8 @@ SECURITY_READ_ONLY_LATE(unsigned long)   real_phys_size;
+ SECURITY_READ_ONLY_LATE(vm_map_address_t) physmap_base = (vm_map_address_t)0;
+ SECURITY_READ_ONLY_LATE(vm_map_address_t) physmap_end = (vm_map_address_t)0;
+ 
++#include <arm64/hakios_ram_banks.inc>
++
+ /*
+  * Bounds of the kernelcache; used for accounting.
+  */
+@@ -362,7 +364,7 @@ typedef struct {
+ 	vm_size_t len;
+ } ptov_table_entry;
+ 
+-#define PTOV_TABLE_SIZE 8
++#define PTOV_TABLE_SIZE (8 + HAKIOS_RAM_BANK_MAX)
+ SECURITY_READ_ONLY_LATE(static ptov_table_entry)        ptov_table[PTOV_TABLE_SIZE];
+ SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
+ 
+@@ -996,9 +998,9 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
+ 		va &= ~ARM_TT_L2_OFFMASK;
+ 		pa = va - gVirtBase + gPhysBase - pa_offset;
+ 
+-		if (pa >= real_avail_end) {
+-			return;
+-		}
++		pmap_paddr_t requested_pa = start - gVirtBase + gPhysBase - pa_offset;
++		pmap_paddr_t mapping_end = hakios_ram_mapping_end(requested_pa);
++		if (pa >= mapping_end) return;          /* (mapping_end 0: above every bank, nothing to map) */
+ 
+ 		tte2 = arm_kva_to_tte(va);
+ 
+@@ -1023,10 +1025,10 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
+ 		}
+ 
+ 		vm_offset_t len = _end - va;
+-		if ((pa + len) > real_avail_end) {
+-			_end -= (pa + len - real_avail_end);
++		if ((pa + len) > mapping_end) {
++			_end -= (pa + len - mapping_end);
+ 		}
+-		assert((start - gVirtBase + gPhysBase - pa_offset) >= gPhysBase);
++		assert(requested_pa < mapping_end);
+ 
+ 		/* Round up to the nearest PAGE_SIZE boundary when creating mappings:
+ 		 * PAGE_SIZE may be a multiple of ARM_PGBYTES, and we don't want to leave
+@@ -1117,7 +1119,10 @@ arm_vm_page_granular_prot(vm_offset_t start, unsigned long size, pmap_paddr_t pa
+ 
+ 			tte2 = arm_kva_to_tte(align_start);
+ 
+-			if ((pa >= gPhysBase) && (pa < real_avail_end)) {
++			/* Apple's own test for the boot bank; a whole twig of an extra bank too. */
++			pmap_paddr_t bank_end = hakios_ram_mapping_end(pa);
++			if ((pa >= gPhysBase && pa < real_avail_end) ||
++			    (bank_end != real_avail_end && bank_end >= pa + ARM_TT_L2_SIZE)) {
+ 				tmplate = (pa & ARM_TTE_BLOCK_L2_MASK) | ARM_TTE_TYPE_BLOCK
+ 				    | ARM_TTE_VALID | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_NX
+ 				    | ARM_TTE_BLOCK_AP(pte_prot_APX) | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY)
+@@ -1576,6 +1581,14 @@ arm_vm_physmap_init(boot_args *args)
+ 	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
+ 	    real_avail_end - args->topOfKernelData, AP_RWNA, 0);
+ 
++
++	/* Compact virtual aperture; never map the physical holes between banks. */
++	for (uint32_t i = 1; i < hakios_managed_ram.count; ++i) {
++		const struct hakios_ram_bank *bank = &hakios_managed_ram.bank[i];
++		vm_map_address_t synthetic_va = gVirtBase + (bank->base - gPhysBase);
++		arm_vm_physmap_slide(temp_ptov_table, synthetic_va, bank->pages << PAGE_SHIFT, AP_RWNA, 0);
++	}
++
+ 	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
+ 
+ 	// Sort in descending order of segment length.  LUT traversal is linear, so largest (most likely used)
+@@ -1603,6 +1616,23 @@ arm_vm_physmap_init(boot_args *args)
+ 	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
+ 	    real_avail_end - args->topOfKernelData, AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); // rest of physmem
+ 
++
++	sweet_early_mark(7, "rb: extra banks");
++	/*
++	 * Compact virtual aperture; never map the physical holes between banks.
++	 * HEROLTE: ALLOW_BLOCK, which makes each entry's VA congruent to its PA modulo a twig. Scion's 0 just put a bank
++	 * after the entry before, and that one ends where topOfKernelData's 4 KiB alignment leaves it (the loader pages
++	 * in 4 KiB): every 16 KiB page of the extra banks straddled two VA pages, the page tables carved from one page
++	 * were never seen together again in pmap_tt_deallocate, and pmap_destroy's tt_entry_free assertion failed.
++	 */
++	for (uint32_t i = 1; i < hakios_managed_ram.count; ++i) {
++		const struct hakios_ram_bank *bank = &hakios_managed_ram.bank[i];
++		vm_map_address_t synthetic_va = gVirtBase + (bank->base - gPhysBase);
++		arm_vm_physmap_slide(temp_ptov_table, synthetic_va, bank->pages << PAGE_SHIFT, AP_RWNA,
++		    ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT);
++	}
++
++	sweet_early_mark(7, "rb: extra banks mapped");
+ 	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
+ 
+ 	// Sort in descending order of segment length.  LUT traversal is linear, so largest (most likely used)
+@@ -1822,7 +1852,11 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+  * space in both the aperture bound and its L1 allocation, including the
+  * ARM_LARGE_MEMORY configuration used by SWEET's non-PPL kernel.
+  */
+-#define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
++/*
++ * HEROLTE: the PTOV entries actually used (the boot ones plus the extra RAM banks), not PTOV_TABLE_SIZE, which grew by
++ * HAKIOS_RAM_BANK_MAX for them: 72 twigs of 32 MiB would be 2.3 GiB more of kernel VA.
++ */
++#define ARM64_PHYSMAP_ALIGNMENT_PADDING ((8 + (vm_size_t)hakios_managed_ram.count) * ARM_TT_TWIG_SIZE)
+ #endif
+ 
+ #if defined(SWEET) && !defined(A5XELTE)
+@@ -1884,8 +1918,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 * in units of the hardware page size and should not need similar treatment.
+ 	 */
+ 	gPhysSize = mem_size = ((gPhysBase + args->memSize) & ~PAGE_MASK) - gPhysBase;
++	mem_size = hakios_ram_boot_memory_size(args, memory_size);
+ 
+-	mem_actual = args->memSizeActual ? args->memSizeActual : mem_size;
++	mem_actual = hakios_managed_ram.count > 1 ? mem_size : (args->memSizeActual ? args->memSizeActual : mem_size);
+ 
+ 	if ((memory_size != 0) && (mem_size > memory_size)) {
+ 		mem_size = memory_size;
+@@ -1898,7 +1933,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	}
+ 
+ #if defined(ARM_LARGE_MEMORY)
+-	unsigned long physmap_l1_entries = ((real_phys_size + ARM64_PHYSMAP_SLIDE_RANGE + ARM64_PHYSMAP_ALIGNMENT_PADDING) >> ARM_TT_L1_SHIFT) + 1;
++	unsigned long physmap_l1_entries = ((real_phys_size + hakios_ram_extra_bytes() + ARM64_PHYSMAP_SLIDE_RANGE + ARM64_PHYSMAP_ALIGNMENT_PADDING) >> ARM_TT_L1_SHIFT) + 1;
+ 	physmap_base = VM_MIN_KERNEL_ADDRESS - (physmap_l1_entries << ARM_TT_L1_SHIFT);
+ #else
+ 	physmap_base = phystokv(args->topOfKernelData);
+@@ -1922,10 +1957,10 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #if defined(ARM_LARGE_MEMORY)
+ 	/* For large memory systems with no PPL such as virtual machines */
+ 	static_memory_end = phystokv(args->topOfKernelData);
+-	physmap_end = physmap_base + real_phys_size + ARM64_PHYSMAP_ALIGNMENT_PADDING;
++	physmap_end = physmap_base + real_phys_size + hakios_ram_extra_bytes() + ARM64_PHYSMAP_ALIGNMENT_PADDING;
+ #else
+ 	static_memory_end = physmap_base + mem_size + ARM64_PHYSMAP_ALIGNMENT_PADDING; // worst possible case for block alignment
+-	physmap_end = physmap_base + real_phys_size + ARM64_PHYSMAP_ALIGNMENT_PADDING;
++	physmap_end = physmap_base + real_phys_size + hakios_ram_extra_bytes() + ARM64_PHYSMAP_ALIGNMENT_PADDING;
+ #endif // ARM_LARGE_MEMORY
+ #endif
+ 
+@@ -1979,6 +2014,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	avail_start = args->topOfKernelData;
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
++	sweet_early_mark(7, "rb: identity map");
+ 	arm_replace_identity_map();
+ #endif
+ 
+@@ -1993,7 +2029,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	cpu_tte = (tt_entry_t *)alloc_ptpage(TRUE);
+ 	cpu_ttep = kvtophys((vm_offset_t)cpu_tte);
+ 	bzero(cpu_tte, ARM_PGBYTES);
+-	avail_end = gPhysBase + mem_size;
++	avail_end = gPhysBase + MIN(gPhysSize, mem_size);
+ 	assert(!(avail_end & PAGE_MASK));
+ 
+ #if KASAN
+@@ -2017,6 +2053,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 *   on large memory systems the physical aperture exists separately below
+ 	 *   the rest of the kernel virtual address space
+ 	 */
++	sweet_early_mark(7, "rb: physmap tables");
+ 	init_ptpages(cpu_tte, physmap_base, ROUND_L1(physmap_end), TRUE, ARM_DYNAMIC_TABLE_XN | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
+ #endif
+ 
+@@ -2133,6 +2170,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	vm_prelink_sdata = segPRELINKDATAB;
+ 	vm_prelink_edata = segPRELINKDATAB + segSizePRELINKDATA;
+ 
++	sweet_early_mark(7, "rb: prot_init");
+ 	arm_vm_prot_init(args);
+ 
+ 	/*
+@@ -2183,6 +2221,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	/* phystokv() must still refer to the bootstrap aperture here. */
+ 	sweet_early_map_final();
+ #endif
++	sweet_early_mark(7, "rb: physmap_init");
+ 	arm_vm_physmap_init(args);
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
+ 
+diff --git a/osfmk/arm64/hakios_ram_banks.h b/osfmk/arm64/hakios_ram_banks.h
+new file mode 100644
+index 0000000..81f4f8c
+--- /dev/null
++++ b/osfmk/arm64/hakios_ram_banks.h
+@@ -0,0 +1,134 @@
++/* Shared loader/VM model for discontinuous physical RAM.
++ * Only firmware-claimed, reservation-filtered ranges may be added here.
++ * Bank order defines compact metadata indices; physical addresses need not be ordered.
++ * This model never makes a physical gap into managed memory.
++ */
++#ifndef HAKIOS_RAM_BANKS_H
++#define HAKIOS_RAM_BANKS_H
++
++#include <stdint.h>
++
++#define HAKIOS_RAM_BANK_MAX 16u     /* HEROLTE: 7 used (bank 2 and six pieces of bank 1); phystokv walks the PTOV table */
++
++struct hakios_ram_bank {
++    uint64_t base;
++    uint64_t pages;
++    uint64_t first_index;
++};
++
++struct hakios_ram_banks {
++    uint32_t count;
++    uint32_t page_shift;
++    uint64_t total_pages;
++    struct hakios_ram_bank bank[HAKIOS_RAM_BANK_MAX];
++};
++
++#if defined(KERNEL)
++extern struct hakios_ram_banks hakios_managed_ram;
++uint64_t hakios_ram_pmap_index(uint64_t address);
++uint64_t hakios_ram_pmap_pa(uint64_t index);
++void hakios_ram_set_vm_first_page(uint64_t ppnum);
++uint64_t hakios_ram_vm_page_pa(uint64_t index);
++#endif
++
++enum hakios_ram_result {
++    HAKIOS_RAM_OK = 0,
++    HAKIOS_RAM_INVALID,
++    HAKIOS_RAM_OVERLAP,
++    HAKIOS_RAM_FULL,
++    HAKIOS_RAM_OVERFLOW
++};
++
++static inline int
++hakios_ram_banks_init(struct hakios_ram_banks *table, uint32_t page_shift)
++{
++    if (page_shift < 12 || page_shift > 16) return HAKIOS_RAM_INVALID;
++    *table = (struct hakios_ram_banks){ .page_shift = page_shift };
++    return HAKIOS_RAM_OK;
++}
++
++/* Append preserves every previously assigned index. Only forward adjacency to
++ * the final bank is merged, so coalescing cannot reorder existing pages. */
++static inline int
++hakios_ram_bank_add_mode(struct hakios_ram_banks *table, uint64_t base, uint64_t bytes, int merge_adjacent)
++{
++    if (table->page_shift < 12 || table->page_shift > 16 || table->count > HAKIOS_RAM_BANK_MAX)
++        return HAKIOS_RAM_INVALID;
++    uint64_t mask = (UINT64_C(1) << table->page_shift) - 1;
++    if (!bytes || ((base | bytes) & mask)) return HAKIOS_RAM_INVALID;
++    if (bytes > UINT64_MAX - base) return HAKIOS_RAM_OVERFLOW;
++    uint64_t end = base + bytes;
++    uint64_t pages = bytes >> table->page_shift;
++    if (pages > (UINT64_MAX >> table->page_shift) - table->total_pages)
++        return HAKIOS_RAM_OVERFLOW;
++    for (uint32_t i = 0; i < table->count; ++i) {
++        const struct hakios_ram_bank *bank = &table->bank[i];
++        uint64_t bank_end = bank->base + (bank->pages << table->page_shift);
++        if (base < bank_end && bank->base < end) return HAKIOS_RAM_OVERLAP;
++    }
++    if (table->count && merge_adjacent) {
++        struct hakios_ram_bank *last = &table->bank[table->count - 1];
++        if (last->base + (last->pages << table->page_shift) == base) {
++            last->pages += pages;
++            table->total_pages += pages;
++            return HAKIOS_RAM_OK;
++        }
++    }
++    if (table->count == HAKIOS_RAM_BANK_MAX) return HAKIOS_RAM_FULL;
++    table->bank[table->count++] = (struct hakios_ram_bank){
++        .base = base, .pages = pages, .first_index = table->total_pages };
++    table->total_pages += pages;
++    return HAKIOS_RAM_OK;
++}
++
++static inline int
++hakios_ram_bank_add(struct hakios_ram_banks *table, uint64_t base, uint64_t bytes)
++{
++    return hakios_ram_bank_add_mode(table, base, bytes, 1);
++}
++
++/* Accept page-interior addresses, as pmap's pa_valid/pa_index do. */
++static inline int
++hakios_ram_pa_index(const struct hakios_ram_banks *table, uint64_t address, uint64_t *index)
++{
++    for (uint32_t i = 0; i < table->count; ++i) {
++        const struct hakios_ram_bank *bank = &table->bank[i];
++        if (address >= bank->base) {
++            uint64_t page = (address - bank->base) >> table->page_shift;
++            if (page < bank->pages) {
++                *index = bank->first_index + page;
++                return 1;
++            }
++        }
++    }
++    return 0;
++}
++
++static inline int
++hakios_ram_index_pa(const struct hakios_ram_banks *table, uint64_t index, uint64_t *address)
++{
++    if (index >= table->total_pages) return 0;
++    for (uint32_t i = 0; i < table->count; ++i) {
++        const struct hakios_ram_bank *bank = &table->bank[i];
++        if (index >= bank->first_index && index - bank->first_index < bank->pages) {
++            *address = bank->base + ((index - bank->first_index) << table->page_shift);
++            return 1;
++        }
++    }
++    return 0;
++}
++
++/* Bound a physical/DMA operation to one real contiguous bank. */
++static inline uint64_t
++hakios_ram_contiguous_bytes(const struct hakios_ram_banks *table, uint64_t address)
++{
++    for (uint32_t i = 0; i < table->count; ++i) {
++        const struct hakios_ram_bank *bank = &table->bank[i];
++        uint64_t bytes = bank->pages << table->page_shift;
++        if (address >= bank->base && address - bank->base < bytes)
++            return bytes - (address - bank->base);
++    }
++    return 0;
++}
++
++#endif
+diff --git a/osfmk/arm64/hakios_ram_banks.inc b/osfmk/arm64/hakios_ram_banks.inc
+new file mode 100644
+index 0000000..e703728
+--- /dev/null
++++ b/osfmk/arm64/hakios_ram_banks.inc
+@@ -0,0 +1,114 @@
++/* Included by arm_vm_init.c after its physical-window globals.
++ * boot_args retains the primary contiguous bootstrap window. Only the explicit,
++ * opt-in DT bank list contributes extra pages; gaps never enlarge that window.
++ */
++#include <arm64/hakios_ram_banks.h>
++
++SECURITY_READ_ONLY_LATE(struct hakios_ram_banks) hakios_managed_ram;
++SECURITY_READ_ONLY_LATE(static uint64_t) hakios_vm_first_ram_index;
++
++uint64_t
++hakios_ram_pmap_index(uint64_t address)
++{
++    uint64_t index;
++    if (!hakios_ram_pa_index(&hakios_managed_ram, address, &index))
++        panic("ram_banks: unmanaged physical address 0x%llx", address);
++    return index;
++}
++
++uint64_t
++hakios_ram_pmap_pa(uint64_t index)
++{
++    uint64_t address;
++    if (!hakios_ram_index_pa(&hakios_managed_ram, index, &address))
++        panic("ram_banks: invalid metadata index 0x%llx", index);
++    return address;
++}
++
++void
++hakios_ram_set_vm_first_page(uint64_t ppnum)
++{
++    if (hakios_managed_ram.count > 1)
++        hakios_vm_first_ram_index = hakios_ram_pmap_index(ppnum << PAGE_SHIFT);
++}
++
++uint64_t
++hakios_ram_vm_page_pa(uint64_t index)
++{
++    if (index > UINT64_MAX - hakios_vm_first_ram_index)
++        panic("ram_banks: VM page index overflow");
++    return hakios_ram_pmap_pa(hakios_vm_first_ram_index + index);
++}
++
++static uint64_t
++hakios_ram_extra_bytes(void)
++{
++    if (hakios_managed_ram.count <= 1) return 0;
++    return (hakios_managed_ram.total_pages - hakios_managed_ram.bank[0].pages) << PAGE_SHIFT;
++}
++
++/* The primary mapping may include the KASAN shadow or an unused capped tail,
++ * whereas additional mappings must end at their own bank's exact boundary. */
++static pmap_paddr_t
++hakios_ram_mapping_end(pmap_paddr_t address)
++{
++    if (address >= gPhysBase && address < real_avail_end) return real_avail_end;
++    for (uint32_t i = 1; i < hakios_managed_ram.count; ++i) {
++        const struct hakios_ram_bank *bank = &hakios_managed_ram.bank[i];
++        uint64_t size = bank->pages << PAGE_SHIFT;
++        if (address >= bank->base && address - bank->base < size) return bank->base + size;
++    }
++    /*
++     * HEROLTE: anything else as Apple's code had it ("if (pa >= real_avail_end) return"): below the boot bank's end
++     * it is mapped, above it not. Scion's panic here made any such mapping fatal, with or without extra banks.
++     */
++    return address < real_avail_end ? real_avail_end : 0;
++}
++
++static uint64_t
++hakios_ram_boot_memory_size(boot_args *args, uint64_t limit)
++{
++    /*
++     * HEROLTE: on whenever the ADT has the list (mkadt_herolte.py --bank1), boot-arg ram_banks=0 turns it off: the
++     * boot line has no room left for an opt-in. Without the list, the one boot bank, as before.
++     */
++    int enabled = 1;
++    PE_parse_boot_argn("ram_banks", &enabled, sizeof(enabled));
++    if (enabled != 1)
++        return gPhysSize;
++    DTEntry chosen;
++    void *property = NULL;
++    unsigned int length = 0;
++    if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++        SecureDTGetProperty(chosen, "hakios-ram-banks", &property, &length) != kSuccess || !property || !length)
++        return gPhysSize;
++    if (length % 16 || length / 16 > HAKIOS_RAM_BANK_MAX)
++        panic("ram_banks: malformed claimed-bank list");
++    struct { uint64_t base, bytes; } range;
++    if (hakios_ram_banks_init(&hakios_managed_ram, PAGE_SHIFT) != HAKIOS_RAM_OK)
++        panic("ram_banks: unsupported page size");
++    uint64_t remaining = limit ? (limit & ~((uint64_t)PAGE_MASK)) : UINT64_MAX;
++    for (unsigned int i = 0; i < length / 16; ++i) {
++        memcpy(&range, (const char *)property + i * 16, sizeof(range));
++        if (i == 0 && (range.base != args->physBase || range.bytes != args->memSize))
++            panic("ram_banks: primary bank differs from boot_args");
++        if (!remaining) break;
++        if (range.bytes > remaining) range.bytes = remaining;
++        /* Keep the bootstrap bank boundary even if another claim is adjacent. */
++        if (hakios_ram_bank_add_mode(&hakios_managed_ram, range.base, range.bytes, 0) != HAKIOS_RAM_OK)
++            panic("ram_banks: invalid, overlapping or overflowing bank %u", i);
++        remaining -= range.bytes;
++    }
++    if (!hakios_managed_ram.count) panic("ram_banks: no usable memory");
++#if KASAN || XNU_MONITOR
++    if (hakios_managed_ram.count > 1)
++        panic("ram_banks: extra banks require the generic non-KASAN pmap configuration");
++#endif
++    uint64_t bytes = hakios_managed_ram.total_pages << PAGE_SHIFT;
++    /*
++     * HEROLTE: no kprintf here. This runs inside arm_vm_init, long before serial_init maps the UART: the first
++     * 0326 boot stopped right after "entering arm_vm_init" with no panic text. pmap_bootstrap's console says it.
++     */
++    sweet_early_mark(7, "ram banks: list read");
++    return bytes;
++}
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 76d70b9..28f619d 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -876,9 +876,33 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 	if (sig == 11 || sig == 10) {
+ 		/* Which mapping the faulting address is in, or which two it falls between. */
+ 		uint64_t far = (uint64_t)saved_state64(ss)->far;
++		{
++			/* HEROLTE: fault syndrome and the physical page behind far, for SIGBUS that is not a VM fault. */
++			extern unsigned int pmap_cache_attributes(ppnum_t pn);
++			uint32_t esr = (uint32_t)saved_state64(ss)->esr;
++			ppnum_t pn = pmap_find_phys(current_map()->pmap, (addr64_t)(far & ~(uint64_t)PAGE_MASK));
++			printf("CRASH %s esr 0x%x ec 0x%x fsc 0x%x wnr %u pa 0x%llx managed %d wimg 0x%x\n", name,
++			    esr, esr >> 26, esr & 0x3f, (esr >> 6) & 1, (unsigned long long)ptoa_64(pn) | (far & (uint64_t)PAGE_MASK),
++			    pn ? (int)pmap_valid_page(pn) : -1, pn && pmap_valid_page(pn) ? pmap_cache_attributes(pn) : 0xffffffffu);
++		}
+ 		vm_map_t map = current_map();
+ 		vm_map_entry_t entry;
+ 		vm_map_lock_read(map);
++		/* HEROLTE (0336): general registers, and the mapping behind each pointer-sized user value. */
++		for (int r = 0; r < 29; r += 4) {
++			printf("CRASH %s x%d 0x%llx 0x%llx 0x%llx 0x%llx\n", name, r,
++			    saved_state64(ss)->x[r], saved_state64(ss)->x[r + 1],
++			    r + 2 < 29 ? saved_state64(ss)->x[r + 2] : 0, r + 3 < 29 ? saved_state64(ss)->x[r + 3] : 0);
++		}
++		for (int r = 0; r < 29; r++) {
++			uint64_t v = saved_state64(ss)->x[r];
++			vm_map_entry_t e;
++			if (v >= 0x100000000ULL && v < 0x1000000000ULL && vm_map_lookup_entry(map, (vm_map_offset_t)v, &e)) {
++				printf("CRASH %s x%d in 0x%llx-0x%llx prot %d/%d tag %d%s\n", name, r,
++				    (uint64_t)e->vme_start, (uint64_t)e->vme_end, e->protection, e->max_protection,
++				    (int)VME_ALIAS(e), e->is_sub_map ? " submap" : "");
++			}
++		}
+ 		bool inside = vm_map_lookup_entry(map, (vm_map_offset_t)far, &entry);
+ 		for (int i = 0; i < 2 && entry != vm_map_to_entry(map); i++) {
+ 			printf("CRASH %s map%s 0x%llx-0x%llx prot %d/%d tag %d\n", name,
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 993c625..6c391eb 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -2164,6 +2164,36 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+ #endif
+ 
+ 	assert(cprocessor == current_processor());
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/*
++	 * A fast core goes idle (after Scion's sched_slow_secondaries, Galaxy S9, ported to sweet_fast_map): of the slow
++	 * cores that run something at a UI priority, the one with the highest is told to reschedule. thread_select there
++	 * sends the thread back with AST_REBALANCE (below) and choose_processor puts it on this core. Before, a UI thread
++	 * that had landed on an A53 stayed there for its whole quantum, a Mongoose idling beside it.
++	 */
++	if (sweet_fast_map != 0 && bit_test(sweet_fast_map, cprocessor->cpu_id)) {
++		processor_t slow = PROCESSOR_NULL;
++		integer_t highest = BASEPRI_USER_INITIATED - 1;
++		sched_ipi_type_t slow_ipi = SCHED_IPI_NONE;
++		uint64_t running_slow = cpset->cpu_state_map[PROCESSOR_RUNNING] & ~sweet_fast_map &
++		    ~cpset->pending_AST_URGENT_cpu_mask & cpset->recommended_bitmask;
++		for (int cpuid = lsb_first(running_slow); cpuid >= 0; cpuid = lsb_next(running_slow, cpuid)) {
++			processor_t sp = processor_array[cpuid];
++			if (sp != cprocessor && sp->current_pri < BASEPRI_RTQUEUES && sp->current_pri > highest) {
++				highest = sp->current_pri;
++				slow = sp;
++			}
++		}
++		if (slow != PROCESSOR_NULL) {
++			slow_ipi = sched_ipi_action(slow, NULL, SCHED_IPI_EVENT_SMT_REBAL);
++		}
++		pset_unlock(cpset);
++		if (slow != PROCESSOR_NULL && slow_ipi != SCHED_IPI_NONE) {
++			sched_ipi_perform(slow, slow_ipi);
++		}
++		return;
++	}
++#endif
+ 	if (cprocessor->is_SMT == FALSE) {
+ 		goto smt_balance_exit;
+ 	}
+@@ -2640,6 +2670,15 @@ restart:
+ 		bool is_yielding         = (*reason & AST_YIELD) == AST_YIELD;
+ 
+ 		bool needs_smt_rebalance = !is_yielding && thread->sched_pri < BASEPRI_RTQUEUES && processor->processor_primary != processor;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		/* A thread that wants a fast core, on a slow one, while a fast one is idle: it moves (sched_SMT_balance above). */
++		if (!needs_smt_rebalance && !is_yielding && sweet_fast_map != 0 && thread->sched_pri < BASEPRI_RTQUEUES &&
++		    thread->bound_processor == PROCESSOR_NULL && !bit_test(sweet_fast_map, processor->cpu_id) &&
++		    (pset->recommended_bitmask & pset->primary_map & sweet_fast_map & pset->cpu_state_map[PROCESSOR_IDLE]) != 0 &&
++		    sweet_wants_fast(thread)) {
++			needs_smt_rebalance = true;
++		}
++#endif
+ 
+ 		bool affinity_mismatch   = thread->affinity_set != AFFINITY_SET_NULL && thread->affinity_set->aset_pset != pset;
+ 
+diff --git a/osfmk/vm/vm_object.c b/osfmk/vm/vm_object.c
+index fa256e6..af70495 100644
+--- a/osfmk/vm/vm_object.c
++++ b/osfmk/vm/vm_object.c
+@@ -7250,6 +7250,19 @@ vm_object_change_wimg_mode(vm_object_t object, unsigned int wimg_mode)
+ 
+ 	vm_object_lock_assert_exclusive(object);
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* (0334) anonymous memory made non-cacheable: atomics there fault (FSC 0x35) */
++	if (object->internal && wimg_mode != VM_WIMG_USE_DEFAULT && (wimg_mode & VM_MEM_NOT_CACHEABLE)) {
++		extern char *proc_name_address(void *p);
++		extern void *get_bsdtask_info(task_t);
++		static int herolte_wimg_logged;
++		if (herolte_wimg_logged < 20) {
++			herolte_wimg_logged++;
++			printf("HEROLTE WIMG: anonymous object %p (%llu pages) to 0x%x by %s\n", object,
++			    (unsigned long long)object->resident_page_count, wimg_mode, proc_name_address(get_bsdtask_info(current_task())));
++		}
++	}
++#endif
+ 	vm_object_paging_only_wait(object, THREAD_UNINT);
+ 
+ 	vm_page_queue_iterate(&object->memq, p, vmp_listq) {
+diff --git a/osfmk/vm/vm_page.h b/osfmk/vm/vm_page.h
+index 90a4b3b..ccdfb4b 100644
+--- a/osfmk/vm/vm_page.h
++++ b/osfmk/vm/vm_page.h
+@@ -408,6 +408,8 @@ VMP_CS_SET_NX(
+ 
+ #if defined(__arm64__)
+ 
++#include <arm64/hakios_ram_banks.h>
++
+ extern  unsigned int vm_first_phys_ppnum;
+ 
+ struct vm_page_with_ppnum {
+@@ -422,6 +424,8 @@ static inline ppnum_t
+ VM_PAGE_GET_PHYS_PAGE(vm_page_t m)
+ {
+ 	if (m >= vm_page_array_beginning_addr && m < vm_page_array_ending_addr) {
++		if (hakios_managed_ram.count > 1)
++			return (ppnum_t)(hakios_ram_vm_page_pa((uint64_t)(m - vm_page_array_beginning_addr)) >> PAGE_SHIFT);
+ 		return (ppnum_t)((uintptr_t)(m - vm_page_array_beginning_addr) + vm_first_phys_ppnum);
+ 	} else {
+ 		return ((vm_page_with_ppnum_t)m)->vmp_phys_page;
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index 6394730..6ef6b05 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -1554,6 +1554,7 @@ pmap_startup(
+ #if defined(__arm64__)
+ 		if (i == 0) {
+ 			vm_first_phys_ppnum = phys_page;
++			hakios_ram_set_vm_first_page(phys_page);
+ 			patch_low_glo_vm_page_info((void *)vm_page_array_beginning_addr,
+ 			    (void *)vm_page_array_ending_addr, vm_first_phys_ppnum);
+ 		}

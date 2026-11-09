@@ -1,0 +1,104 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -174,6 +174,8 @@
+ 	bool          fFadeTrace;
+ 	uint64_t      fFadeRequest;
+ 	uint64_t      fFadeWork;
++	uint32_t      fBrightnessTraceBudget; /* protected by fLock */
++	bool          fBrightnessTrace;
+ #endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -333,6 +335,13 @@
+ 	PE_parse_boot_argn("herolock", &fade_trace, sizeof(fade_trace));
+ 	fImmediateBlack = fade == 0;
+ 	fFadeTrace = fade_trace == 1;
++	int brightness_trace = 0;
++	PE_parse_boot_argn("herobrighttrace", &brightness_trace, sizeof(brightness_trace));
++	fBrightnessTrace = brightness_trace == 1;
++	fBrightnessTraceBudget = 512;
++	if (fBrightnessTrace) {
++		IOLog("HEROLTE BRIGHT: IOMFB trace enabled (512 calls)\n");
++	}
+ #endif
+ 	uint32_t hz = 10;
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+@@ -1124,6 +1133,65 @@
+ 	    kIOUserNotifyOptionCanDrop);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/* Inspect only the known display-control calls and inline input supplied by IOKit. */
++static void
++herolte_brightness_trace(AppleCLCD *fb, uint32_t selector, const IOExternalMethodArguments *args)
++{
++	switch (selector) {
++	case kSweetFBRequestPowerChange:
++	case 17: /* SetGammaTable */
++	case 27: /* GetGammaTable */
++	case 50: /* SetBrightnessCorrection */
++	case 66: /* SPLCSetBrightness */
++	case 67: /* SPLCGetBrightness */
++	case 68: /* SetParameter */
++	case 78: /* SetBlock */
++	case 79: /* GetBlock */
++	case 84: /* SetContrast */
++		break;
++	default:
++		return;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	if (strcmp(name, "backboardd") != 0 && strcmp(name, "SpringBoard") != 0) {
++		return;
++	}
++	IOLockLock(fb->fLock);
++	uint32_t remaining = fb->fBrightnessTraceBudget;
++	if (remaining != 0) {
++		fb->fBrightnessTraceBudget--;
++	}
++	IOLockUnlock(fb->fLock);
++	if (remaining == 0) {
++		return;
++	}
++	uint64_t scalar0 = 0, scalar1 = 0, data = 0;
++	if (args->scalarInput != NULL && args->scalarInputCount > 0) {
++		scalar0 = args->scalarInput[0];
++		if (args->scalarInputCount > 1) {
++			scalar1 = args->scalarInput[1];
++		}
++	}
++	bool inline_data = args->structureInputDescriptor == NULL && args->structureInput != NULL;
++	if (inline_data && selector == 68 && args->structureInputSize == sizeof(data)) {
++		memcpy(&data, args->structureInput, sizeof(data));
++	}
++	if (inline_data && selector == 17 && args->structureInputSize == 3084) {
++		/* Compare gamma tables without logging their contents. */
++		const uint8_t *gamma = (const uint8_t *)args->structureInput;
++		data = 14695981039346656037ULL;
++		for (uint32_t i = 0; i < args->structureInputSize; i++) {
++			data = (data ^ gamma[i]) * 1099511628211ULL;
++		}
++	}
++	IOLog("HEROLTE BRIGHT: sample=%u t=%llu %s sel=%u in=%u/%u out=%u/%u scalar=%#llx/%#llx data=%#llx\n",
++	    513 - remaining, mach_absolute_time(), name, selector, args->scalarInputCount,
++	    args->structureInputSize, args->scalarOutputCount, args->structureOutputSize, scalar0, scalar1, data);
++}
++#endif
++
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+ 
+ IOReturn
+@@ -1134,6 +1202,11 @@
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	if (fFB->fBrightnessTrace) {
++		herolte_brightness_trace(fFB, selector, args);
++	}
++#endif
+ 
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:

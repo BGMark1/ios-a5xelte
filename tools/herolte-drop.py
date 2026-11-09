@@ -82,7 +82,7 @@ def main():
     local = 'herolte-drop.bin'
     open(local, 'wb').write(blob)
     adb(args.adb, 'push', local, '/tmp/drop.bin')
-    adb(args.adb, 'shell', f'dd if=/tmp/drop.bin of={DEV} bs={BLOCK} seek={first} conv=fsync')
+    adb(args.adb, 'shell', f'dd if=/tmp/drop.bin of={DEV} bs={BLOCK} seek={first} && sync')
     back = adb(args.adb, 'shell', f'dd if={DEV} bs={BLOCK} skip={first} count={len(blob) // BLOCK} '
                                   f'2>/dev/null | sha256sum').split()[0].decode()
     adb(args.adb, 'shell', 'rm /tmp/drop.bin')

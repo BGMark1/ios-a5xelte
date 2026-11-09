@@ -1,0 +1,66 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index f0b657f..a652279 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -702,6 +702,10 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+ 	return ret;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++static int sweet_surface_planar_logged;
++#endif
++
+ IOReturn
+ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ {
+@@ -838,6 +842,24 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		return ret;
+ 	}
+ 	ret = returnSurface(s, args);   /* takes the creator's user count */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* (0336) where a planar surface landed in its creator, and its planes */
++	if (ret == kIOReturnSuccess && s->planeCount > 0 && sweet_surface_planar_logged < 24) {
++		sweet_surface_planar_logged++;
++		IOLockLock(fLock);
++		SweetSurfaceRef *ref = findRef(s->id, NULL);
++		unsigned long long at = ref != NULL && ref->data != NULL ? (unsigned long long)ref->data->getAddress() : 0ULL;
++		IOLockUnlock(fLock);
++		IOLog("SWEET SURF: id %u planar at 0x%llx alloc %u offset %u\n", s->id,
++		    at,
++		    s->allocSize, s->offset);
++		for (uint32_t i = 0; i < s->planeCount; i++) {
++			IOLog("SWEET SURF:   id %u plane %u %ux%u bpr %u offset %u size %u bpe %u\n", s->id, i,
++			    s->planes[i].width, s->planes[i].height, s->planes[i].bytesPerRow, s->planes[i].offset,
++			    s->planes[i].size, s->planes[i].bytesPerElement);
++		}
++	}
++#endif
+ 	s->release();
+ 	return ret;
+ }
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 4a37877..28f619d 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -888,6 +888,21 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 		vm_map_t map = current_map();
+ 		vm_map_entry_t entry;
+ 		vm_map_lock_read(map);
++		/* HEROLTE (0336): general registers, and the mapping behind each pointer-sized user value. */
++		for (int r = 0; r < 29; r += 4) {
++			printf("CRASH %s x%d 0x%llx 0x%llx 0x%llx 0x%llx\n", name, r,
++			    saved_state64(ss)->x[r], saved_state64(ss)->x[r + 1],
++			    r + 2 < 29 ? saved_state64(ss)->x[r + 2] : 0, r + 3 < 29 ? saved_state64(ss)->x[r + 3] : 0);
++		}
++		for (int r = 0; r < 29; r++) {
++			uint64_t v = saved_state64(ss)->x[r];
++			vm_map_entry_t e;
++			if (v >= 0x100000000ULL && v < 0x1000000000ULL && vm_map_lookup_entry(map, (vm_map_offset_t)v, &e)) {
++				printf("CRASH %s x%d in 0x%llx-0x%llx prot %d/%d tag %d%s\n", name, r,
++				    (uint64_t)e->vme_start, (uint64_t)e->vme_end, e->protection, e->max_protection,
++				    (int)VME_ALIAS(e), e->is_sub_map ? " submap" : "");
++			}
++		}
+ 		bool inside = vm_map_lookup_entry(map, (vm_map_offset_t)far, &entry);
+ 		for (int i = 0; i < 2 && entry != vm_map_to_entry(map); i++) {
+ 			printf("CRASH %s map%s 0x%llx-0x%llx prot %d/%d tag %d\n", name,

@@ -1,0 +1,72 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 40627ad..9b9db12 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -341,6 +341,13 @@ static uint32_t hg_affinity = 1;
+  * 2: and not after vertex jobs either, whose results the fragment job reads through the same cache.
+  */
+ static uint32_t hg_flush_mode = 1;
++/*
++ * (0341) Boot-arg herogpu_sleep=N: a client's job is polled for herogpu_spin us (50 by default), then the thread
++ * sleeps N us at a time between polls instead of spinning (delay(10) spins here, a core busy for every job of the
++ * ~15 a frame). 0 (default): polled as before.
++ */
++static uint32_t hg_sleep_us, hg_spin_us = 50;
++static uint64_t hg_sleeps, hg_sleep_jobs;
+ /* GPU VA of the job chain hg_run() starts, and of its header (for the log). */
+ static uint64_t hg_job_va = HG_TEST_VA;
+ static vm_offset_t hg_job_cpu;
+@@ -763,6 +770,33 @@ hg_run(unsigned js, const char *what)
+ 	hg_wr(hg_gpu, slot + 0x60, 1);                          /* START */
+ 
+ 	uint32_t jirq = 0, mirq = 0, girq = 0;
++	if (hg_run_quiet && hg_sleep_us != 0) {
++		uint64_t t0 = mach_absolute_time(), spin, step, limit;
++		nanoseconds_to_absolutetime((uint64_t)hg_spin_us * 1000, &spin);
++		nanoseconds_to_absolutetime((uint64_t)hg_sleep_us * 1000, &step);
++		nanoseconds_to_absolutetime(200000000ULL, &limit);
++		bool slept = false;
++		for (;;) {
++			jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
++			mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
++			girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
++			if ((jirq & ((1u << js) | (1u << (js + 16)))) || mirq || (girq & 0x81)) {
++				break;
++			}
++			uint64_t now = mach_absolute_time();
++			if (now - t0 > limit) {
++				break;
++			}
++			if (now - t0 < spin) {
++				continue;
++			}
++			assert_wait_deadline((event_t)&hg_sleeps, THREAD_UNINT, now + step);
++			thread_block(THREAD_CONTINUE_NULL);
++			hg_sleeps++;
++			slept = true;
++		}
++		hg_sleep_jobs += slept ? 1 : 0;
++	} else {
+ 	for (unsigned i = 0; i < 20000; i++) {
+ 		jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
+ 		mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
+@@ -772,6 +806,7 @@ hg_run(unsigned js, const char *what)
+ 		}
+ 		delay(10);
+ 	}
++	}
+ 	volatile uint32_t *hdr = (volatile uint32_t *)(hg_job_cpu ? hg_job_cpu : hg_mem + HG_DATA_OFF);
+ 	bool ok = (jirq & (1u << js)) && !(jirq & (1u << (js + 16))) && !mirq && !(girq & 0x81);
+ 	hg_last_js_status = hg_rd(hg_gpu, slot + 0x24);
+@@ -3775,6 +3810,11 @@ herolte_gpu_probe(void)
+ 	}
+ 
+ 	PE_parse_boot_argn("herogpu_flush", &hg_flush_mode, sizeof(hg_flush_mode));
++	PE_parse_boot_argn("herogpu_sleep", &hg_sleep_us, sizeof(hg_sleep_us));
++	PE_parse_boot_argn("herogpu_spin", &hg_spin_us, sizeof(hg_spin_us));
++	if (hg_sleep_us) {
++		printf("HEROLTE GPU: client jobs polled %u us, then sleep %u us between polls\n", hg_spin_us, hg_sleep_us);
++	}
+ 	int wifi = 1;                                           /* herowifi=0: no Wi-Fi */
+ 	PE_parse_boot_argn("herowifi", &wifi, sizeof(wifi));
+ 	if (wifi &&

@@ -1,0 +1,331 @@
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index 9bd8b50..bd8b403 100644
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -243,14 +243,14 @@ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, uns
+ 	return 0;
+ }
+ 
+-bool
+-herolte_pmic66_read(uint8_t reg, uint8_t *value)
++static bool
++hm_read(uint32_t page, uint8_t reg, uint8_t *value)
+ {
+ 	if (!fg_i2c) {
+ 		return false;
+ 	}
+ 	lck_mtx_lock(&fg_mtx);
+-	fg_target = 0x66u;
++	fg_target = page;
+ 	bool ok = false;
+ 	for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
+ 		ok = fg_message(false, &reg, 1, false) && fg_message(true, value, 1, true);
+@@ -260,15 +260,15 @@ herolte_pmic66_read(uint8_t reg, uint8_t *value)
+ 	return ok;
+ }
+ 
+-bool
+-herolte_pmic66_write(uint8_t reg, uint8_t value)
++static bool
++hm_write(uint32_t page, uint8_t reg, uint8_t value)
+ {
+ 	if (!fg_i2c) {
+ 		return false;
+ 	}
+ 	uint8_t b[2] = { reg, value };
+ 	lck_mtx_lock(&fg_mtx);
+-	fg_target = 0x66u;
++	fg_target = page;
+ 	bool ok = false;
+ 	for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
+ 		ok = fg_message(false, b, 2, true);
+@@ -278,6 +278,21 @@ herolte_pmic66_write(uint8_t reg, uint8_t value)
+ 	return ok;
+ }
+ 
++bool
++herolte_pmic66_read(uint8_t reg, uint8_t *value)
++{
++	return hm_read(0x66u, reg, value);
++}
++
++bool
++herolte_pmic66_write(uint8_t reg, uint8_t value)
++{
++	return hm_write(0x66u, reg, value);
++}
++
++/* (0344) Samsung's max77854-private.h: PMIC/haptic 0xCC (0x66 here), charger 0xD2, gauge 0x6C, MUIC 0x4A. */
++#define HM_CHG  0x69u
++
+ /*
+  * Cable and charge state from the charger itself, not the gauge's current: CHGIN_OK (0xb2 bit 6) with CHGIN_DTLS
+  * (0xb3 [6:5]) 3 = valid VBUS; CHG_DTLS (0xb4 [3:0]) 0-2 charging, 3-4 top-off/done (Samsung counts both as full).
+@@ -288,21 +303,22 @@ int
+ herolte_chg_state(bool *external, bool *charging, bool *full)
+ {
+ 	uint8_t ok = 0, d0 = 0, d1 = 0;
+-	if (!herolte_pmic66_read(0xb2, &ok) || !herolte_pmic66_read(0xb3, &d0) || !herolte_pmic66_read(0xb4, &d1)) {
++	if (!hm_read(HM_CHG, 0xb2, &ok) || !hm_read(HM_CHG, 0xb3, &d0) || !hm_read(HM_CHG, 0xb4, &d1)) {
+ 		return -1;
+ 	}
+ 	static uint8_t last_ok = 0xff, last_d1 = 0xff;
+ 	static unsigned logged;
+ 	if ((ok != last_ok || (d1 & 0x0f) != last_d1) && logged < 40) {
+ 		logged++;
+-		uint8_t c0 = 0, c2 = 0, c9 = 0, c10 = 0, d2 = 0;
+-		herolte_pmic66_read(0xb5, &d2);
+-		herolte_pmic66_read(0xb7, &c0);
+-		herolte_pmic66_read(0xb9, &c2);
+-		herolte_pmic66_read(0xc0, &c9);
+-		herolte_pmic66_read(0xc1, &c10);
+-		printf("HEROLTE CHG: int_ok %#x dtls %#x/%#x/%#x cnfg_00 %#x, charge %u mA (cnfg_02 %#x), input %u mA (cnfg_09 %#x, cnfg_10 %#x)\n",
+-		    ok, d0, d1, d2, c0, (c2 & 0x3fu) * 50u, c2, (c9 & 0x3fu) * 30u, c9, c10);
++		uint8_t c0 = 0, c2 = 0, c9 = 0, c10 = 0, d2 = 0, id = 0;
++		hm_read(HM_CHG, 0xb5, &d2);
++		hm_read(HM_CHG, 0xb7, &c0);
++		hm_read(HM_CHG, 0xb9, &c2);
++		hm_read(HM_CHG, 0xc0, &c9);
++		hm_read(HM_CHG, 0xc1, &c10);
++		herolte_pmic66_read(0x00, &id);
++		printf("HEROLTE CHG: pmic id %#x, int_ok %#x dtls %#x/%#x/%#x cnfg_00 %#x, charge %u mA (cnfg_02 %#x), input %u mA (cnfg_09 %#x, cnfg_10 %#x)\n",
++		    id, ok, d0, d1, d2, c0, (c2 & 0x3fu) * 50u, c2, (c9 & 0x3fu) * 30u, c9, c10);
+ 		last_ok = ok;
+ 		last_d1 = d1 & 0x0f;
+ 	}
+@@ -330,7 +346,6 @@ void herolte_vibrate(uint32_t ms);
+ static vm_offset_t hv_pwm;
+ static uint64_t hv_tin_hz;
+ static int hv_state;            /* 0 not set up, 1 ready, -1 failed */
+-static thread_call_t hv_off_call;
+ static LCK_MTX_DECLARE(hv_mtx, &fg_grp);
+ 
+ static void
+@@ -368,9 +383,10 @@ hv_setup(void)
+ 	fg_wr(fg_pins, HV_GPD0, (fg_rd(fg_pins, HV_GPD0) & ~(0xfu << 20)) | (2u << 20));
+ 	fg_wr(fg_pins, HV_GPD0 + 8, (fg_rd(fg_pins, HV_GPD0 + 8) & ~(3u << 10)) | (1u << 10));
+ 	/* timer 1: prescaler 0 (+1), divider 1/1; its input clock measured with a free count */
+-	uint32_t tcon = fg_rd(hv_pwm, 0x08) & ~(0xfu << 8);
++	uint32_t tcon = fg_rd(hv_pwm, 0x08) & ~(0xbu << 8);
+ 	fg_wr(hv_pwm, 0x04, fg_rd(hv_pwm, 0x04) & ~(0xfu << 4));
+ 	uint32_t pre = fg_rd(hv_pwm, 0x00) & 0xffu;
++	fg_wr(hv_pwm, 0x00, fg_rd(hv_pwm, 0x00) & ~0xffu);
+ 	fg_wr(hv_pwm, 0x18, 0xffffffffu);
+ 	fg_wr(hv_pwm, 0x1c, 0);
+ 	fg_wr(hv_pwm, 0x08, tcon | (1u << 9));
+@@ -383,7 +399,7 @@ hv_setup(void)
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+ 	fg_wr(hv_pwm, 0x08, tcon);
+ 	hv_tin_hz = ns ? (uint64_t)(c0 - c1) * 1000000000ull / ns : 0;
+-	printf("HEROLTE VIB: timer 1 counts %u in %llu ns (prescaler %u): %llu Hz\n", c0 - c1, ns, pre, hv_tin_hz);
++	printf("HEROLTE VIB: timer 1 counts %u in %llu ns (prescaler was %u, now 0): %llu Hz\n", c0 - c1, ns, pre, hv_tin_hz);
+ 	if (hv_tin_hz < 1000000) {
+ 		printf("HEROLTE VIB: the PWM timer does not run, no vibration\n");
+ 		hv_state = -1;
+@@ -410,18 +426,65 @@ hv_setup(void)
+ 	return ok;
+ }
+ 
++static uint32_t hv_on_ms, hv_off_ms, hv_duty = HV_DUTY_NS, hv_gen;
++static bool hv_repeat;
++static uint64_t hv_until;       /* a repeating pattern stops by itself after 2 minutes */
++static thread_call_t hv_call;
++void herolte_vib_pattern(uint32_t on_ms, uint32_t off_ms, bool repeat, uint32_t intensity_q16);
++
++static void
++hv_motor_locked(bool on)
++{
++	uint32_t tcon = fg_rd(hv_pwm, 0x08) & ~(0xbu << 8);
++	if (on) {
++		hv_pwm_set(hv_duty);
++		fg_wr(hv_pwm, 0x08, tcon | (1u << 9) | (1u << 11));
++		fg_wr(hv_pwm, 0x08, tcon | (1u << 8) | (1u << 11));
++		herolte_pmic66_write(0x10, 0x82u | 0x40u);
++	} else {
++		herolte_pmic66_write(0x10, 0x82u);
++		hv_pwm_set(HV_PERIOD_NS / 2);
++		fg_wr(hv_pwm, 0x08, tcon);
++	}
++}
++
+ static void
+-hv_off(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++hv_schedule_locked(uint32_t ms, bool turn_on)
+ {
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	thread_call_enter1_delayed(hv_call, (thread_call_param_t)(uintptr_t)((hv_gen << 1) | (turn_on ? 1u : 0u)), deadline);
++}
++
++static void
++hv_tick(__unused thread_call_param_t p0, thread_call_param_t p1)
++{
++	uint32_t v = (uint32_t)(uintptr_t)p1;
+ 	lck_mtx_lock(&hv_mtx);
+-	herolte_pmic66_write(0x10, 0x82u);
+-	hv_pwm_set(HV_PERIOD_NS / 2);
+-	fg_wr(hv_pwm, 0x08, fg_rd(hv_pwm, 0x08) & ~(1u << 8));
++	if (hv_state != 1 || (v >> 1) != hv_gen) {
++		lck_mtx_unlock(&hv_mtx);
++		return;
++	}
++	bool more = hv_repeat && mach_absolute_time() < hv_until;
++	if (v & 1u) {
++		if (more) {
++			hv_motor_locked(true);
++			hv_schedule_locked(hv_on_ms, false);
++		}
++	} else if (more && hv_off_ms == 0) {
++		hv_schedule_locked(hv_on_ms, false);    /* continuous */
++	} else {
++		hv_motor_locked(false);
++		if (more) {
++			hv_schedule_locked(hv_off_ms, true);
++		}
++	}
+ 	lck_mtx_unlock(&hv_mtx);
+ }
+ 
++/* on_ms 0: stop. intensity_q16: 16.16 fixed (iOS's "intensity"), 0 or >= 1.0: full force. */
+ void
+-herolte_vibrate(uint32_t ms)
++herolte_vib_pattern(uint32_t on_ms, uint32_t off_ms, bool repeat, uint32_t intensity_q16)
+ {
+ 	lck_mtx_lock(&hv_mtx);
+ 	if (hv_state == 0) {
+@@ -431,27 +494,37 @@ herolte_vibrate(uint32_t ms)
+ 		lck_mtx_unlock(&hv_mtx);
+ 		return;
+ 	}
+-	if (!hv_off_call) {
+-		hv_off_call = thread_call_allocate_with_options(hv_off, NULL, THREAD_CALL_PRIORITY_HIGH, THREAD_CALL_OPTIONS_ONCE);
++	if (!hv_call) {
++		hv_call = thread_call_allocate_with_options(hv_tick, NULL, THREAD_CALL_PRIORITY_HIGH, 0);
++	}
++	hv_gen++;
++	if (hv_call) {
++		thread_call_cancel(hv_call);
+ 	}
+-	if (ms == 0) {
++	if (on_ms == 0 || !hv_call) {
++		hv_repeat = false;
++		hv_motor_locked(false);
+ 		lck_mtx_unlock(&hv_mtx);
+-		thread_call_cancel(hv_off_call);
+-		hv_off(NULL, NULL);
+ 		return;
+ 	}
+-	if (ms > 10000) {
+-		ms = 10000;     /* haptic,max_timeout */
+-	}
+-	uint32_t tcon = fg_rd(hv_pwm, 0x08) & ~(0xfu << 8);
+-	hv_pwm_set(HV_DUTY_NS);
+-	fg_wr(hv_pwm, 0x08, tcon | (1u << 9) | (1u << 11));
+-	fg_wr(hv_pwm, 0x08, tcon | (1u << 8) | (1u << 11));
+-	herolte_pmic66_write(0x10, 0x82u | 0x40u);
++	hv_on_ms = on_ms > 10000 ? 10000 : on_ms;       /* haptic,max_timeout */
++	hv_off_ms = off_ms > 10000 ? 10000 : off_ms;
++	hv_repeat = repeat;
++	uint32_t half = HV_PERIOD_NS / 2;
++	hv_duty = (intensity_q16 == 0 || intensity_q16 >= 0x10000u) ? HV_DUTY_NS :
++	    half + (uint32_t)((uint64_t)(HV_DUTY_NS - half) * intensity_q16 >> 16);
++	uint64_t span;
++	nanoseconds_to_absolutetime(120ull * NSEC_PER_SEC, &span);
++	hv_until = mach_absolute_time() + span;
++	hv_motor_locked(true);
++	hv_schedule_locked(hv_on_ms, false);
+ 	lck_mtx_unlock(&hv_mtx);
+-	uint64_t deadline;
+-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+-	thread_call_enter_delayed(hv_off_call, deadline);
++}
++
++void
++herolte_vibrate(uint32_t ms)
++{
++	herolte_vib_pattern(ms, 0, false, 0);
+ }
+ 
+ /* Boot-arg herovib=N: once the APM answers, three pulses of N ms, a second apart (a hardware check). */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index d5e2997..76d7983 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -17,6 +17,57 @@
+ extern "C" int herolte_fg_init(void);
+ extern "C" int herolte_chg_state(bool *external, bool *charging, bool *full);
+ extern "C" void herolte_vib_init(void);
++extern "C" void herolte_vib_pattern(uint32_t on_ms, uint32_t off_ms, bool repeat, uint32_t intensity_q16);
++
++/*
++ * (0344) iOS 16's MediaExperience (FigVibrator_IOKit.c, used when libVibeSynthEngine reports no haptic hardware):
++ * IOServiceGetMatchingService(IOServiceNameMatching("vibrator")), then IORegistryEntrySetCFProperties with
++ * { hertz_millisecs: [ { intensity: 16.16 fixed }, on ms, bool, off ms ], repeat: bool } to start, and another
++ * hertz_millisecs (repeat false) to stop. The same lookup answers "has a vibrator".
++ */
++class SweetVibrator : public IOService {
++	OSDeclareDefaultStructors(SweetVibrator);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(SweetVibrator, IOService);
++
++IOReturn
++SweetVibrator::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	static unsigned logged;
++	if (logged < 16) {
++		logged++;
++		OSSerialize *ser = OSSerialize::withCapacity(256);
++		if (ser && d->serialize(ser)) {
++			IOLog("SWEET VIBRATOR: %.400s\n", ser->text());
++		}
++		OSSafeReleaseNULL(ser);
++	}
++	OSArray *a = OSDynamicCast(OSArray, d->getObject("hertz_millisecs"));
++	OSBoolean *repeat = OSDynamicCast(OSBoolean, d->getObject("repeat"));
++	uint32_t ms[2] = { 0, 0 }, q16 = 0;
++	unsigned n = 0;
++	for (unsigned i = 0; a && i < a->getCount(); i++) {
++		OSObject *o = a->getObject(i);
++		OSNumber *num = OSDynamicCast(OSNumber, o);
++		OSDictionary *sub = OSDynamicCast(OSDictionary, o);
++		if (num && n < 2) {
++			ms[n++] = num->unsigned32BitValue();
++		} else if (sub) {
++			OSNumber *in = OSDynamicCast(OSNumber, sub->getObject("intensity"));
++			if (in) {
++				q16 = in->unsigned32BitValue();
++			}
++		}
++	}
++	herolte_vib_pattern(ms[0], ms[1], repeat && repeat->isTrue(), q16);
++	return kIOReturnSuccess;
++}
+ extern "C" int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma,
+     unsigned *rem_mah, unsigned *full_mah);
+ #define BATTERY_DESIGN_MAH 3000u        /* SM-G930F EB-BG930ABE */
+@@ -316,6 +367,19 @@ SweetBattery::start(IOService *provider)
+ 	/* Default on; herofg=0 keeps the static fallback. */
+ 	fReal = herolte_fg_init() == 0;
+ 	herolte_vib_init();
++	SweetVibrator *vib = OSTypeAlloc(SweetVibrator);
++	if (vib && vib->init()) {
++		vib->setName("vibrator");
++		if (vib->attach(this)) {
++			if (vib->start(this)) {
++				vib->registerService();
++				IOLog("SWEET VIBRATOR: registered\n");
++			} else {
++				vib->detach(this);
++			}
++		}
++	}
++	OSSafeReleaseNULL(vib);
+ #else
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));

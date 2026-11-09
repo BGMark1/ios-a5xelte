@@ -1,0 +1,135 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index fdfe4f2..2cd45e1 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2984,12 +2984,15 @@ static void
+ hg_test_swipes(void)
+ {
+ 	extern void sweet_hid_touch(int, int, int, int);
++	extern void herolte_fast_rebalance_counts(uint64_t *, uint64_t *);
+ 	enum { finger = 9, steps = 12, count = 12 };
+ 	const int left = HG_PANEL_W / 5;
+ 	const int right = HG_PANEL_W * 4 / 5;
+ 	const int y = HG_PANEL_H * 3 / 5;
+ 
+ 	printf("HEROSWIPE BEGIN %u\n", (unsigned)count);
++	uint64_t nudges_before, requeues_before;
++	herolte_fast_rebalance_counts(&nudges_before, &requeues_before);
+ 	for (unsigned swipe = 0; swipe < count; swipe++) {
+ 		int start = swipe % 2 ? left : right;
+ 		int end = swipe % 2 ? right : left;
+@@ -3000,7 +3003,11 @@ hg_test_swipes(void)
+ 		sweet_hid_touch(finger, 0, end, y);
+ 		hg_msleep(1200);
+ 	}
++	uint64_t nudges_after, requeues_after;
++	herolte_fast_rebalance_counts(&nudges_after, &requeues_after);
+ 	printf("HEROSWIPE END\n");
++	printf("HEROSCHED: swipe window Mongoose nudges %llu requeues %llu\n",
++	    nudges_after - nudges_before, requeues_after - requeues_before);
+ }
+ 
+ /*
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 993c625..aed495b 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -151,6 +151,26 @@ bool sched_stats_active;
+  * an idle slow core first, keeping the fast ones free.
+  */
+ static cpumap_t sweet_fast_map = 0xf0;
++static uint32_t herolte_fast_rebalance;
++static uint64_t herolte_fast_nudges;
++static uint64_t herolte_fast_requeues;
++
++void herolte_fast_rebalance_counts(uint64_t *nudges, uint64_t *requeues);
++
++void
++herolte_fast_rebalance_counts(uint64_t *nudges, uint64_t *requeues)
++{
++	*nudges = os_atomic_load(&herolte_fast_nudges, relaxed);
++	*requeues = os_atomic_load(&herolte_fast_requeues, relaxed);
++}
++
++/* The caller holds the processor-set lock. */
++static inline cpumap_t
++herolte_idle_fast(processor_set_t pset)
++{
++	return pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map &
++	       pset->recommended_bitmask & sweet_fast_map;
++}
+ 
+ /*
+  * Herolte: Mongoose is three or four times an A53 here. launchd and mediaserverd alone use up to three CPUs, with
+@@ -525,6 +545,7 @@ sched_init(void)
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	PE_parse_boot_argn("sweetfast", &sweet_fast_map, sizeof(sweet_fast_map));
++	PE_parse_boot_argn("herofastrebalance", &herolte_fast_rebalance, sizeof(herolte_fast_rebalance));
+ 	kprintf("Scheduler: SWEET fast cores 0x%llx\n", (unsigned long long)sweet_fast_map);
+ #endif
+ 
+@@ -2156,6 +2177,7 @@ void
+ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+ {
+ 	processor_t ast_processor = NULL;
++	sched_ipi_type_t ipi_type = SCHED_IPI_NONE;
+ 
+ #if (DEVELOPMENT || DEBUG)
+ 	if (__improbable(sched_smt_balance == 0)) {
+@@ -2164,6 +2186,29 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+ #endif
+ 
+ 	assert(cprocessor == current_processor());
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* When a Mongoose idles, prompt an eligible A53 to run thread_select(). */
++	if (herolte_fast_rebalance == 1 && bit_test(herolte_idle_fast(cpset), cprocessor->cpu_id)) {
++		cpumap_t candidates = cpset->cpu_state_map[PROCESSOR_RUNNING] & cpset->recommended_bitmask &
++		    ~sweet_fast_map & ~cpset->pending_AST_URGENT_cpu_mask & ~cpset->pending_AST_PREEMPT_cpu_mask;
++		int highest = BASEPRI_USER_INITIATED - 1;
++		for (int id = lsb_first(candidates); id >= 0; id = lsb_next(candidates, id)) {
++			processor_t slow = processor_array[id];
++			if (!slow->current_is_bound && slow->current_pri < BASEPRI_RTQUEUES && slow->current_pri > highest) {
++				highest = slow->current_pri;
++				ast_processor = slow;
++			}
++		}
++		if (ast_processor != PROCESSOR_NULL) {
++			ipi_type = sched_ipi_action(ast_processor, NULL, SCHED_IPI_EVENT_SMT_REBAL);
++			if (ipi_type != SCHED_IPI_NONE) {
++				os_atomic_inc(&herolte_fast_nudges, relaxed);
++				goto smt_balance_exit;
++			}
++			ast_processor = PROCESSOR_NULL;
++		}
++	}
++#endif
+ 	if (cprocessor->is_SMT == FALSE) {
+ 		goto smt_balance_exit;
+ 	}
+@@ -2178,8 +2223,6 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+ 	}
+ 
+ 	processor_t sprocessor;
+-
+-	sched_ipi_type_t ipi_type = SCHED_IPI_NONE;
+ 	uint64_t running_secondary_map = (cpset->cpu_state_map[PROCESSOR_RUNNING] &
+ 	    ~cpset->primary_map);
+ 	for (int cpuid = lsb_first(running_secondary_map); cpuid >= 0; cpuid = lsb_next(running_secondary_map, cpuid)) {
+@@ -2640,6 +2683,16 @@ restart:
+ 		bool is_yielding         = (*reason & AST_YIELD) == AST_YIELD;
+ 
+ 		bool needs_smt_rebalance = !is_yielding && thread->sched_pri < BASEPRI_RTQUEUES && processor->processor_primary != processor;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		/* Recheck under the pset lock. The idle fast CPU may have been taken
++		 * since the nudge. Use the existing HEROLTE priority and hog policy. */
++		if (herolte_fast_rebalance == 1 && still_running && !needs_smt_rebalance && !is_yielding &&
++		    thread->sched_pri < BASEPRI_RTQUEUES && thread->bound_processor == PROCESSOR_NULL &&
++		    !bit_test(sweet_fast_map, processor->cpu_id) && herolte_idle_fast(pset) != 0 && sweet_wants_fast(thread)) {
++			needs_smt_rebalance = true;
++			os_atomic_inc(&herolte_fast_requeues, relaxed);
++		}
++#endif
+ 
+ 		bool affinity_mismatch   = thread->affinity_set != AFFINITY_SET_NULL && thread->affinity_set->aset_pset != pset;
+ 

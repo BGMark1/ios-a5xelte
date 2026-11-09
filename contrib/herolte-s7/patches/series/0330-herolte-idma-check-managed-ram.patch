@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 0b3ec20..fdfe4f2 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -21,6 +21,7 @@
+ #include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <vm/pmap.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void herolte_gpu_probe(void);
+@@ -1675,6 +1676,7 @@ hgp_map_locked(uint32_t id, const uint64_t *pages, unsigned n)
+  * buffer for good.
+  */
+ #define HG_FB2_PA       0x91000000ull
++#define HG_FB2_RESERVED (16u * 1024u * 1024u)
+ #define HG_PANEL2_VA    0x06000000ull
+ #define HGP_FB2_TABLES  8u
+ #define HGP_FB2_L3_OFF  (HGP_L3_OFF + HGP_SLOTS * HGP_SLOT_TABLES * 0x1000u)
+@@ -1682,6 +1684,8 @@ _Static_assert(HGP_FB2_L3_OFF + HGP_FB2_TABLES * 0x1000u <= HG_SCR_BYTES,
+     "second panel tables exceed GPU scratch memory");
+ _Static_assert(HG_PANEL_BYTES <= HGP_FB2_TABLES * 0x200000u,
+     "second panel exceeds GPU mapping");
++_Static_assert(HG_PANEL_BYTES <= HG_FB2_RESERVED,
++    "second panel exceeds its physical reservation");
+ #define HG_IDMA_G1_PA   0x13952000u
+ #define HG_DECON_F_PA   0x13960000u
+ static vm_offset_t hfb_idma;
+@@ -1730,10 +1734,15 @@ hfb_setup_locked(void)
+ 	if (on != 1) {
+ 		return;
+ 	}
+-	/* This test reserves the first-bank buffer only with the single bank2 layout. */
++	/* Keep the established bootstrap layout and check the extra managed banks separately. */
+ 	const boot_args *args = PE_state.bootArgs;
+ 	if (!args || args->physBase != 0x880000000ull || args->memSizeActual != 0x80000000ull) {
+-		printf("HEROLTE FB2: requires the 2 GiB bank2 layout; one buffer\n");
++		printf("HEROLTE FB2: requires the 2 GiB bank2 boot window; one buffer\n");
++		return;
++	}
++	if (pmap_has_managed_page((ppnum_t)(HG_FB2_PA >> PAGE_SHIFT),
++	    (ppnum_t)((HG_FB2_PA + HG_FB2_RESERVED - 1) >> PAGE_SHIFT))) {
++		printf("HEROLTE FB2: second buffer overlaps managed RAM; one buffer\n");
+ 		return;
+ 	}
+ 	vm_offset_t decon = ml_io_map(HG_DECON_F_PA, 0x1000);

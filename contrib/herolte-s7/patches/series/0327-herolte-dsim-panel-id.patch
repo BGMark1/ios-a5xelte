@@ -1,0 +1,100 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -2863,6 +2863,85 @@
+ 	printf("HEROLTE DECON: %s: %u frames in 200 ms, period %llu us, reading %llu us, top line %u, span %llu us\n", when, frames,
+ 	    period / 26, active / 26, top, (rise - first) / 26);
+ }
++/* Exynos8890 DSIM0 offsets checked against the stock SM-G930F kernel. */
++#define HERO_DSIM_STATUS 0x08
++#define HERO_DSIM_INTSRC 0x34
++#define HERO_DSIM_PKTHDR 0x3c
++#define HERO_DSIM_RXFIFO 0x44
++#define HERO_DSIM_FIFOCTRL 0x4c
++#define HERO_DSIM_CMD_CONFIG 0x78
++#define HERO_DSIM_HS_READY (1u << 10)
++#define HERO_DSIM_PH_EMPTY (1u << 10)
++#define HERO_DSIM_RX_EMPTY (1u << 12)
++#define HERO_DSIM_RX_DONE (1u << 18)
++#define HERO_DSIM_PACKETGO (1u << 21)
++
++/* Wait at most 100 ms without changing the inherited host configuration. */
++static bool
++hero_dsim_wait(vm_offset_t dsim, uint32_t reg, uint32_t bits)
++{
++	uint64_t start = mach_absolute_time(), timeout;
++	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &timeout);
++	while ((hg_rd(dsim, reg) & bits) != bits) {
++		if (mach_absolute_time() - start >= timeout) {
++			return false;
++		}
++		delay(10);
++	}
++	return true;
++}
++
++/* DCS Get Display ID (0x04). This issues a read only; no vendor keys or dimming commands. */
++static void
++hero_dsim_panel_id(vm_offset_t dsim)
++{
++	const uint32_t fifo = hg_rd(dsim, HERO_DSIM_FIFOCTRL);
++	const uint32_t status = hg_rd(dsim, HERO_DSIM_STATUS);
++	const uint32_t config = hg_rd(dsim, HERO_DSIM_CMD_CONFIG);
++	if (!(status & HERO_DSIM_HS_READY) || (config & HERO_DSIM_PACKETGO) ||
++	    (fifo & (HERO_DSIM_PH_EMPTY | HERO_DSIM_RX_EMPTY)) != (HERO_DSIM_PH_EMPTY | HERO_DSIM_RX_EMPTY)) {
++		printf("HEROLTE PANEL: ID skipped, DSIM status %#x fifo %#x cmd config %#x\n", status, fifo, config);
++		return;
++	}
++
++	hg_wr(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
++	hg_wr(dsim, HERO_DSIM_PKTHDR, 0x37u | (3u << 8)); /* Maximum return packet size, 3 bytes */
++	if (!hero_dsim_wait(dsim, HERO_DSIM_FIFOCTRL, HERO_DSIM_PH_EMPTY)) {
++		printf("HEROLTE PANEL: DSIM did not send maximum return packet size\n");
++		return;
++	}
++	hg_wr(dsim, HERO_DSIM_PKTHDR, 0x06u | (0x04u << 8)); /* DCS read, bus turnaround by packet type */
++	const bool done = hero_dsim_wait(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
++	uint32_t id = 0, first = 0;
++	bool found = false, bad = false;
++	for (unsigned i = 0; i < 64 && !(hg_rd(dsim, HERO_DSIM_FIFOCTRL) & HERO_DSIM_RX_EMPTY); i++) {
++		const uint32_t hdr = hg_rd(dsim, HERO_DSIM_RXFIFO);
++		if (i == 0) {
++			first = hdr;
++		}
++		if ((hdr & 0x3f) == 0x1c || (hdr & 0x3f) == 0x1a) { /* DCS or generic long response */
++			const uint32_t size = (hdr >> 8) & 0xffff;
++			if (size != 3 || found || (hg_rd(dsim, HERO_DSIM_FIFOCTRL) & HERO_DSIM_RX_EMPTY)) {
++				bad = true;
++				break;
++			}
++			id = hg_rd(dsim, HERO_DSIM_RXFIFO);
++			i++;
++			found = true;
++		} else if ((hdr & 0x3f) != 0x08 && ((hdr & 0x3f) != 0x02 || ((hdr >> 8) & 0xffff) != 0)) {
++			bad = true;
++			break;
++		}
++	}
++	const uint32_t after = hg_rd(dsim, HERO_DSIM_FIFOCTRL);
++	hg_wr(dsim, HERO_DSIM_INTSRC, HERO_DSIM_RX_DONE);
++	if (found && !bad && (after & HERO_DSIM_RX_EMPTY)) {
++		printf("HEROLTE PANEL: DCS ID %02x%02x%02x\n", id & 0xff, (id >> 8) & 0xff, (id >> 16) & 0xff);
++	} else {
++		printf("HEROLTE PANEL: no valid DCS ID (done %u first %#x fifo %#x)\n", (unsigned)done, first, after);
++	}
++}
++
+ static void
+ hg_bus_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -2908,6 +2987,10 @@
+ 		for (unsigned o = 0; dsim && o < 0x80; o += 0x20) {
+ 			printf("HEROLTE DISP: dsim +%#x: %#x %#x %#x %#x %#x %#x %#x %#x\n", o, hg_rd(dsim, o), hg_rd(dsim, o + 4), hg_rd(dsim, o + 8), hg_rd(dsim, o + 12),
+ 			    hg_rd(dsim, o + 16), hg_rd(dsim, o + 20), hg_rd(dsim, o + 24), hg_rd(dsim, o + 28));
++		}
++		int panel_id = 0;
++		if (dsim && PE_parse_boot_argn("heropanelid", &panel_id, sizeof(panel_id)) && panel_id == 1) {
++			hero_dsim_panel_id(dsim);
+ 		}
+ 		/*
+ 		 * 13.97 us a line is 363 cycles of 26 MHz: (720 + 6) pixels at two a cycle. The vclk takes the output of MUX_DISP_PLL,
